@@ -9,7 +9,7 @@ const seedAdminUser = async () => {
     const adminExists = await User.countDocuments();
     if (adminExists === 0) {
       const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash('adminpassword123', salt);
+      const hashedPassword = await bcrypt.hash('Anas@6677#', salt);
       
       await User.create({
         name: 'Towasic Admin',
@@ -18,7 +18,7 @@ const seedAdminUser = async () => {
         phone: '1234567890',
         profileImage: ''
       });
-      console.log('Seeded default admin credentials: admin@towasicsolutions.com / adminpassword123');
+      console.log('Seeded default admin credentials: admin@towasicsolutions.com / Anas@6677#');
     }
   } catch (error) {
     console.error('Error seeding admin user:', error);
