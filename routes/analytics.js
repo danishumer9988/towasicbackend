@@ -3,45 +3,46 @@ const mongoose = require('mongoose');
 const router = express.Router();
 
 /* ============================================================
-   MODELS (defined inline — no separate model files)
+   MODELS — optimized for minimum size
    ============================================================ */
+
+// TTL: auto-delete docs older than 90 days (in seconds)
+const TTL_90D = 90 * 24 * 60 * 60;
 
 const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoose.Schema({
   visitor_id: { type: String, required: true, unique: true, index: true },
   ip:         { type: String, default: '' },
-  user_agent: { type: String, default: '' },
-  device:     { type: String, default: 'desktop' },
-  browser:    { type: String, default: 'Other' },
-  os:         { type: String, default: 'Other' },
-  screen_w:   { type: Number, default: null },
-  screen_h:   { type: Number, default: null },
-  viewport_w: { type: Number, default: null },
-  viewport_h: { type: Number, default: null },
+  device:     { type: String, default: 'desktop' },  // 'mobile' | 'tablet' | 'desktop'
+  browser:    { type: String, default: 'Other' },    // 'Chrome' | 'Safari' | ...
+  os:         { type: String, default: 'Other' },    // 'Windows' | 'macOS' | ...
+  sw:         { type: Number, default: null },       // screen width
+  sh:         { type: Number, default: null },       // screen height
+  vw:         { type: Number, default: null },       // viewport width
+  vh:         { type: Number, default: null },       // viewport height
   first_seen: { type: Date, default: Date.now },
-  last_seen:  { type: Date, default: Date.now, index: true },
+  last_seen:  { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
 const Session = mongoose.models.Session || mongoose.model('Session', new mongoose.Schema({
-  session_id:   { type: String, required: true, unique: true, index: true },
-  visitor_id:   { type: String, required: true, index: true },
-  landing_page: { type: String, default: '/' },
-  exit_page:    { type: String, default: '/' },
-  referrer:     { type: String, default: '' },
-  page_views:   { type: Number, default: 1 },
-  clicks:       { type: Number, default: 0 },
-  duration_ms:  { type: Number, default: 0 },
-  started_at:   { type: Date, default: Date.now, index: true },
-  ended_at:     { type: Date, default: Date.now },
+  session_id:  { type: String, required: true, unique: true, index: true },
+  visitor_id:  { type: String, required: true, index: true },
+  landing:     { type: String, default: '/' },
+  exit:        { type: String, default: '/' },
+  ref_host:    { type: String, default: '' },        // referrer hostname only
+  page_views:  { type: Number, default: 1 },
+  clicks:      { type: Number, default: 0 },
+  duration_ms: { type: Number, default: 0 },
+  started_at:  { type: Date, default: Date.now, index: true },
+  ended_at:    { type: Date, default: Date.now },
 }));
 
 const PageView = mongoose.models.PageView || mongoose.model('PageView', new mongoose.Schema({
   visitor_id: { type: String, required: true, index: true },
   session_id: { type: String, required: true, index: true },
-  url:        { type: String, default: '' },
   path:       { type: String, default: '/', index: true },
   title:      { type: String, default: '' },
-  referrer:   { type: String, default: '' },
-  timestamp:  { type: Date, default: Date.now, index: true },
+  ref_host:   { type: String, default: '' },         // hostname only
+  timestamp:  { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
 const Activity = mongoose.models.Activity || mongoose.model('Activity', new mongoose.Schema({
@@ -49,11 +50,10 @@ const Activity = mongoose.models.Activity || mongoose.model('Activity', new mong
   session_id:  { type: String, required: true, index: true },
   type:        { type: String, required: true, index: true },
   path:        { type: String, default: '' },
-  url:         { type: String, default: '' },
-  element:     { type: String, default: '' },
-  text:        { type: String, default: '' },
-  destination: { type: String, default: '' },
-  timestamp:   { type: Date, default: Date.now, index: true },
+  element:     { type: String, default: '' },        // 'a' | 'button' | ...
+  text:        { type: String, default: '' },        // truncated to 60 chars
+  destination: { type: String, default: '' },        // path only
+  timestamp:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
 /* ============================================================
@@ -82,6 +82,12 @@ const parseUA = (ua = '') => {
   return { device, browser, os };
 };
 
+// Extract just the hostname from a referrer URL — saves ~80% of the string
+const hostOf = (url = '') => {
+  if (!url) return '';
+  try { return new URL(url).hostname; } catch { return ''; }
+};
+
 const rangeStart = (range = '7d') => {
   const days = { today: 1, yesterday: 2, '7d': 7, '30d': 30, '90d': 90 }[range] || 7;
   const d = new Date();
@@ -97,7 +103,7 @@ const strip = (doc) => {
 };
 
 /* ============================================================
-   POST /api/track   (called by the frontend tracker)
+   POST /api/track
    ============================================================ */
 router.post('/track', async (req, res) => {
   try {
@@ -116,16 +122,17 @@ router.post('/track', async (req, res) => {
     const { device, browser, os } = parseUA(ua);
 
     if (type === 'pageview') {
+      // Visitor — shorter field names (sw/sh/vw/vh), no user_agent
       await Visitor.findOneAndUpdate(
         { visitor_id: visitorId },
         {
           $set: {
-            ip, user_agent: ua, device, browser, os,
-            screen_w:   screen?.w   ?? null,
-            screen_h:   screen?.h   ?? null,
-            viewport_w: viewport?.w ?? null,
-            viewport_h: viewport?.h ?? null,
-            last_seen:  new Date(),
+            ip, device, browser, os,
+            sw: screen?.w   ?? null,
+            sh: screen?.h   ?? null,
+            vw: viewport?.w ?? null,
+            vh: viewport?.h ?? null,
+            last_seen: new Date(),
           },
           $setOnInsert: { visitor_id: visitorId, first_seen: new Date() },
         },
@@ -136,9 +143,10 @@ router.post('/track', async (req, res) => {
       if (!existing) {
         await Session.create({
           session_id: sessionId, visitor_id: visitorId,
-          landing_page: path || '/', exit_page: path || '/',
-          referrer: referrer || '', page_views: 1, clicks: 0,
-          duration_ms: 0, started_at: new Date(), ended_at: new Date(),
+          landing: path || '/', exit: path || '/',
+          ref_host: hostOf(referrer),
+          page_views: 1, clicks: 0, duration_ms: 0,
+          started_at: new Date(), ended_at: new Date(),
         });
       } else {
         const lastTs = existing.ended_at ? new Date(existing.ended_at).getTime() : Date.now();
@@ -146,20 +154,30 @@ router.post('/track', async (req, res) => {
         const duration = (existing.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
         await Session.updateOne(
           { session_id: sessionId },
-          { $set: { ended_at: new Date(), duration_ms: duration, exit_page: path || '/' }, $inc: { page_views: 1 } }
+          { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
         );
       }
 
       await PageView.create({
         visitor_id: visitorId, session_id: sessionId,
-        url: url || '', path: path || '/', title: title || '',
-        referrer: referrer || '', timestamp: new Date(),
+        path: path || '/',
+        title: (title || '').slice(0, 120),          // cap title length
+        ref_host: hostOf(referrer),
+        timestamp: new Date(),
       });
     } else if (type === 'click') {
+      // Trim text to 60 chars, destination to path only
+      const dest = (() => {
+        try { return new URL(destination).pathname; } catch { return destination || ''; }
+      })();
+
       await Activity.create({
         visitor_id: visitorId, session_id: sessionId, type: 'click',
-        path: path || '', url: url || '', element: element || '',
-        text: text || '', destination: destination || '', timestamp: new Date(),
+        path: path || '',
+        element: (element || '').slice(0, 16),
+        text: (text || '').slice(0, 60),
+        destination: dest.slice(0, 120),
+        timestamp: new Date(),
       });
       await Session.updateOne(
         { session_id: sessionId },
@@ -244,11 +262,14 @@ router.get('/analytics', async (req, res) => {
       ]);
       const aggMap = agg.reduce((m, r) => (m[r._id] = r, m), {});
 
+      // Remap short field names back to the long ones the UI expects
       return res.json(visitors.map((v) => ({
         ...strip(v),
-        sessions: aggMap[v.visitor_id]?.sessions || 0,
-        pages:    aggMap[v.visitor_id]?.pages    || 0,
-        clicks:   aggMap[v.visitor_id]?.clicks   || 0,
+        screen_w:   v.sw, screen_h: v.sh,
+        viewport_w: v.vw, viewport_h: v.vh,
+        sessions:   aggMap[v.visitor_id]?.sessions || 0,
+        pages:      aggMap[v.visitor_id]?.pages    || 0,
+        clicks:     aggMap[v.visitor_id]?.clicks   || 0,
       })));
     }
 
@@ -266,8 +287,16 @@ router.get('/analytics', async (req, res) => {
       if (!visitor) return res.status(404).json({ error: 'Not found' });
 
       return res.json({
-        visitor: strip(visitor),
-        sessions: sessions.map(strip),
+        visitor: {
+          ...strip(visitor),
+          screen_w: visitor.sw, screen_h: visitor.sh,
+          viewport_w: visitor.vw, viewport_h: visitor.vh,
+        },
+        sessions: sessions.map((s) => ({
+          ...strip(s),
+          landing_page: s.landing,
+          exit_page: s.exit,
+        })),
         pageViews: pageViews.map(strip),
         activities: activities.map(strip),
       });
