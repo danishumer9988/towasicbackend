@@ -5,20 +5,18 @@ const router = express.Router();
 /* ============================================================
    MODELS — optimized for minimum size
    ============================================================ */
-
-// TTL: auto-delete docs older than 90 days (in seconds)
-const TTL_90D = 90 * 24 * 60 * 60;
+const TTL_90D = 90 * 24 * 60 * 60; // 90 days
 
 const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoose.Schema({
   visitor_id: { type: String, required: true, unique: true, index: true },
   ip:         { type: String, default: '' },
-  device:     { type: String, default: 'desktop' },  // 'mobile' | 'tablet' | 'desktop'
-  browser:    { type: String, default: 'Other' },    // 'Chrome' | 'Safari' | ...
-  os:         { type: String, default: 'Other' },    // 'Windows' | 'macOS' | ...
-  sw:         { type: Number, default: null },       // screen width
-  sh:         { type: Number, default: null },       // screen height
-  vw:         { type: Number, default: null },       // viewport width
-  vh:         { type: Number, default: null },       // viewport height
+  device:     { type: String, default: 'desktop' },
+  browser:    { type: String, default: 'Other' },
+  os:         { type: String, default: 'Other' },
+  sw:         { type: Number, default: null },
+  sh:         { type: Number, default: null },
+  vw:         { type: Number, default: null },
+  vh:         { type: Number, default: null },
   first_seen: { type: Date, default: Date.now },
   last_seen:  { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
@@ -28,7 +26,7 @@ const Session = mongoose.models.Session || mongoose.model('Session', new mongoos
   visitor_id:  { type: String, required: true, index: true },
   landing:     { type: String, default: '/' },
   exit:        { type: String, default: '/' },
-  ref_host:    { type: String, default: '' },        // referrer hostname only
+  ref_host:    { type: String, default: '' },
   page_views:  { type: Number, default: 1 },
   clicks:      { type: Number, default: 0 },
   duration_ms: { type: Number, default: 0 },
@@ -41,7 +39,7 @@ const PageView = mongoose.models.PageView || mongoose.model('PageView', new mong
   session_id: { type: String, required: true, index: true },
   path:       { type: String, default: '/', index: true },
   title:      { type: String, default: '' },
-  ref_host:   { type: String, default: '' },         // hostname only
+  ref_host:   { type: String, default: '' },
   timestamp:  { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
@@ -50,16 +48,15 @@ const Activity = mongoose.models.Activity || mongoose.model('Activity', new mong
   session_id:  { type: String, required: true, index: true },
   type:        { type: String, required: true, index: true },
   path:        { type: String, default: '' },
-  element:     { type: String, default: '' },        // 'a' | 'button' | ...
-  text:        { type: String, default: '' },        // truncated to 60 chars
-  destination: { type: String, default: '' },        // path only
+  element:     { type: String, default: '' },
+  text:        { type: String, default: '' },
+  destination: { type: String, default: '' },
   timestamp:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
 /* ============================================================
    HELPERS
    ============================================================ */
-
 const parseUA = (ua = '') => {
   const l = ua.toLowerCase();
   const device = /mobile|android|iphone|ipod|blackberry|opera mini/i.test(l) ? 'mobile'
@@ -73,16 +70,15 @@ const parseUA = (ua = '') => {
   else if (/safari/i.test(l))        browser = 'Safari';
 
   let os = 'Other';
-  if (/windows/i.test(l))                    os = 'Windows';
-  else if (/mac os|macintosh/i.test(l))      os = 'macOS';
-  else if (/android/i.test(l))               os = 'Android';
-  else if (/iphone|ipad|ipod/i.test(l))      os = 'iOS';
-  else if (/linux/i.test(l))                 os = 'Linux';
+  if (/windows/i.test(l))               os = 'Windows';
+  else if (/mac os|macintosh/i.test(l)) os = 'macOS';
+  else if (/android/i.test(l))          os = 'Android';
+  else if (/iphone|ipad|ipod/i.test(l)) os = 'iOS';
+  else if (/linux/i.test(l))            os = 'Linux';
 
   return { device, browser, os };
 };
 
-// Extract just the hostname from a referrer URL — saves ~80% of the string
 const hostOf = (url = '') => {
   if (!url) return '';
   try { return new URL(url).hostname; } catch { return ''; }
@@ -122,7 +118,6 @@ router.post('/track', async (req, res) => {
     const { device, browser, os } = parseUA(ua);
 
     if (type === 'pageview') {
-      // Visitor — shorter field names (sw/sh/vw/vh), no user_agent
       await Visitor.findOneAndUpdate(
         { visitor_id: visitorId },
         {
@@ -161,14 +156,14 @@ router.post('/track', async (req, res) => {
       await PageView.create({
         visitor_id: visitorId, session_id: sessionId,
         path: path || '/',
-        title: (title || '').slice(0, 120),          // cap title length
+        title: (title || '').slice(0, 120),
         ref_host: hostOf(referrer),
         timestamp: new Date(),
       });
     } else if (type === 'click') {
-      // Trim text to 60 chars, destination to path only
       const dest = (() => {
-        try { return new URL(destination).pathname; } catch { return destination || ''; }
+        try { return new URL(destination, window?.location?.origin || 'http://x').pathname; }
+        catch { return destination || ''; }
       })();
 
       await Activity.create({
@@ -179,9 +174,17 @@ router.post('/track', async (req, res) => {
         destination: dest.slice(0, 120),
         timestamp: new Date(),
       });
+
+      // If a click arrives for a session we haven't seen (edge case), create it now
       await Session.updateOne(
         { session_id: sessionId },
-        { $inc: { clicks: 1 }, $set: { ended_at: new Date() } }
+        { $inc: { clicks: 1 }, $set: { ended_at: new Date() },
+          $setOnInsert: {
+            visitor_id: visitorId, landing: path || '/', exit: path || '/',
+            page_views: 0, duration_ms: 0,
+            started_at: new Date(),
+          } },
+        { upsert: true }
       );
     } else {
       return res.status(400).json({ ok: false, error: 'Unknown type' });
@@ -203,8 +206,14 @@ router.get('/analytics', async (req, res) => {
     const range = req.query.range || '7d';
     const start = rangeStart(range);
 
+    /* ---------------- SUMMARY (with advanced metrics) ---------------- */
     if (type === 'summary') {
-      const [uv, ss, pv, cl, avgRow] = await Promise.all([
+      const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+      const [
+        uv, ss, pv, cl, avgRow,
+        activeRow, bounced, newVs, avgPerSession,
+      ] = await Promise.all([
         Visitor.countDocuments({ last_seen: { $gte: start } }),
         Session.countDocuments({ started_at: { $gte: start } }),
         PageView.countDocuments({ timestamp: { $gte: start } }),
@@ -213,13 +222,42 @@ router.get('/analytics', async (req, res) => {
           { $match: { started_at: { $gte: start } } },
           { $group: { _id: null, avg: { $avg: '$duration_ms' } } },
         ]),
+        // Active now — distinct visitors with a pageview in last 5 min
+        PageView.aggregate([
+          { $match: { timestamp: { $gte: fiveMinAgo } } },
+          { $group: { _id: '$visitor_id' } },
+          { $count: 'n' },
+        ]),
+        // Bounce: sessions with ≤ 1 pageview
+        Session.countDocuments({ started_at: { $gte: start }, page_views: { $lte: 1 } }),
+        // New vs Returning
+        Promise.all([
+          Visitor.countDocuments({ first_seen: { $gte: start }, last_seen: { $gte: start } }),
+          Visitor.countDocuments({ last_seen: { $gte: start } }),
+        ]),
+        // Avg pages / clicks per session
+        Session.aggregate([
+          { $match: { started_at: { $gte: start } } },
+          { $group: { _id: null, avgPages: { $avg: '$page_views' }, avgClicks: { $avg: '$clicks' } } },
+        ]),
       ]);
+
       return res.json({
-        uniqueVisitors: uv, sessions: ss, pageViews: pv, clicks: cl,
+        uniqueVisitors: uv,
+        sessions: ss,
+        pageViews: pv,
+        clicks: cl,
         avgSessionMs: Math.round(avgRow[0]?.avg || 0),
+        activeNow: activeRow[0]?.n || 0,
+        bounceRate: ss ? bounced / ss : 0,
+        newVisitors: newVs[0],
+        returningVisitors: Math.max(0, newVs[1] - newVs[0]),
+        avgPagesPerSession: +(avgPerSession[0]?.avgPages || 0).toFixed(2),
+        avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
       });
     }
 
+    /* ---------------- TIMESERIES ---------------- */
     if (type === 'timeseries') {
       const rows = await PageView.aggregate([
         { $match: { timestamp: { $gte: start } } },
@@ -236,6 +274,7 @@ router.get('/analytics', async (req, res) => {
       return res.json(rows);
     }
 
+    /* ---------------- VISITORS LIST ---------------- */
     if (type === 'visitors') {
       const q = (req.query.q || '').trim();
       const filter = { last_seen: { $gte: start } };
@@ -262,17 +301,17 @@ router.get('/analytics', async (req, res) => {
       ]);
       const aggMap = agg.reduce((m, r) => (m[r._id] = r, m), {});
 
-      // Remap short field names back to the long ones the UI expects
       return res.json(visitors.map((v) => ({
         ...strip(v),
-        screen_w:   v.sw, screen_h: v.sh,
+        screen_w: v.sw, screen_h: v.sh,
         viewport_w: v.vw, viewport_h: v.vh,
-        sessions:   aggMap[v.visitor_id]?.sessions || 0,
-        pages:      aggMap[v.visitor_id]?.pages    || 0,
-        clicks:     aggMap[v.visitor_id]?.clicks   || 0,
+        sessions: aggMap[v.visitor_id]?.sessions || 0,
+        pages:    aggMap[v.visitor_id]?.pages    || 0,
+        clicks:   aggMap[v.visitor_id]?.clicks   || 0,
       })));
     }
 
+    /* ---------------- SINGLE VISITOR ---------------- */
     if (type === 'visitor') {
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'Missing id' });
@@ -293,17 +332,17 @@ router.get('/analytics', async (req, res) => {
           viewport_w: visitor.vw, viewport_h: visitor.vh,
         },
         sessions: sessions.map((s) => ({
-          ...strip(s),
-          landing_page: s.landing,
-          exit_page: s.exit,
+          ...strip(s), landing_page: s.landing, exit_page: s.exit,
         })),
         pageViews: pageViews.map(strip),
         activities: activities.map(strip),
       });
     }
 
+    /* ---------------- BREAKDOWNS (with advanced) ---------------- */
     if (type === 'breakdowns') {
-      const [devices, browsers, os, topPages] = await Promise.all([
+      const [devices, browsers, os, topPages,
+             referrers, entryPages, exitPages, hourly] = await Promise.all([
         Visitor.aggregate([
           { $match: { last_seen: { $gte: start } } },
           { $group: { _id: '$device', count: { $sum: 1 } } },
@@ -326,11 +365,48 @@ router.get('/analytics', async (req, res) => {
           { $sort: { views: -1 } },
           { $limit: 15 },
         ]),
+        // Top Referrers
+        PageView.aggregate([
+          { $match: { timestamp: { $gte: start }, ref_host: { $nin: ['', null] } } },
+          { $group: { _id: '$ref_host', count: { $sum: 1 } } },
+          { $sort: { count: -1 } },
+          { $limit: 10 },
+        ]),
+        // Entry Pages
+        Session.aggregate([
+          { $match: { started_at: { $gte: start } } },
+          { $group: { _id: '$landing', views: { $sum: 1 }, unique: { $addToSet: '$visitor_id' } } },
+          { $project: { _id: 1, views: 1, unique: { $size: '$unique' } } },
+          { $sort: { views: -1 } },
+          { $limit: 10 },
+        ]),
+        // Exit Pages
+        Session.aggregate([
+          { $match: { started_at: { $gte: start } } },
+          { $group: { _id: '$exit', views: { $sum: 1 }, unique: { $addToSet: '$visitor_id' } } },
+          { $project: { _id: 1, views: 1, unique: { $size: '$unique' } } },
+          { $sort: { views: -1 } },
+          { $limit: 10 },
+        ]),
+        // Hourly activity (24 buckets)
+        PageView.aggregate([
+          { $match: { timestamp: { $gte: start } } },
+          { $group: { _id: { $hour: '$timestamp' }, count: { $sum: 1 } } },
+          { $project: { _id: 0, hour: '$_id', count: 1 } },
+          { $sort: { hour: 1 } },
+        ]),
       ]);
 
+      // Fill missing hours with 0
+      const hourlyFull = Array.from({ length: 24 }, (_, h) =>
+        hourly.find((r) => r.hour === h) || { hour: h, count: 0 }
+      );
+
       return res.json({
-        devices, browsers, os,
-        countries: [], cities: [], topPages, referrers: [],
+        devices, browsers, os, topPages,
+        referrers, entryPages, exitPages,
+        hourly: hourlyFull,
+        countries: [], cities: [],
       });
     }
 
