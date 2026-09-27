@@ -13,13 +13,13 @@ const {
   sendLoginNotification,
 } = require('../utils/mailer');
 
-const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const OTP_TTL_MS = 10 * 60 * 1000;
 
 const generateToken = (id, role) =>
   jwt.sign({ id, role }, process.env.JWT_SECRET, { expiresIn: '30d' });
 
 const generateOtp = () =>
-  String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+  String(Math.floor(100000 + Math.random() * 900000));
 
 const maskEmail = (email = '') => {
   const [user, domain] = email.split('@');
@@ -49,11 +49,8 @@ const getReqMeta = (req) => {
   return { ip, ua, browser, device, location };
 };
 
-/* Issue a new OTP for an email/purpose. Invalidates old ones. */
 async function issueOtp(email, purpose) {
-  // Invalidate prior unused OTPs for this email+purpose
   await OtpToken.deleteMany({ email: email.toLowerCase(), purpose, usedAt: null });
-
   const otp = generateOtp();
   const otpHash = await bcrypt.hash(otp, 10);
   await OtpToken.create({
@@ -65,7 +62,6 @@ async function issueOtp(email, purpose) {
   return otp;
 }
 
-/* Verify an OTP for email+purpose. Marks it used. Returns boolean. */
 async function consumeOtp(email, purpose, otp) {
   const record = await OtpToken.findOne({
     email: email.toLowerCase(),
@@ -91,10 +87,9 @@ const publicUser = (u) => ({
 });
 
 /* ==================================================================
-   LOGIN
+   LOGIN — 2-step: email+password → OTP → login
    ================================================================== */
 
-/* POST /api/auth-otp/login-start   { email, password } */
 router.post('/login-start', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
@@ -106,7 +101,7 @@ router.post('/login-start', async (req, res) => {
     if (!user) return res.status(404).json({ message: 'Invalid email or password' });
 
     if (user.pendingInvite) {
-      return res.status(403).json({ message: 'Account not activated. Verify your invite first.' });
+      return res.status(403).json({ message: 'Account not activated. Ask admin for the activation code.' });
     }
 
     const ok = await bcrypt.compare(password, user.password);
@@ -123,7 +118,6 @@ router.post('/login-start', async (req, res) => {
   }
 });
 
-/* POST /api/auth-otp/login-verify   { email, otp } */
 router.post('/login-verify', async (req, res) => {
   const { email, otp } = req.body || {};
   if (!email || !otp) return res.status(400).json({ message: 'Email and code are required' });
@@ -135,13 +129,11 @@ router.post('/login-verify', async (req, res) => {
     const valid = await consumeOtp(user.email, 'login', otp);
     if (!valid) return res.status(401).json({ message: 'Invalid or expired code' });
 
-    // Record login metadata
     const meta = getReqMeta(req);
     user.lastLoginAt = new Date();
     user.lastLoginIp = meta.ip;
     await user.save();
 
-    // Fire-and-forget admin notification
     sendLoginNotification(user.email, meta).catch(() => {});
 
     return res.json({
@@ -155,13 +147,18 @@ router.post('/login-verify', async (req, res) => {
 });
 
 /* ==================================================================
-   INVITE (admin-only)
+   INVITE — admin creates user + OTP goes to admin email
    ================================================================== */
 
-/* POST /api/auth-otp/invite   { name, email, role }   [protected] */
 router.post('/invite', protect, async (req, res) => {
-  const { name, email, role = 'user' } = req.body || {};
-  if (!name || !email) return res.status(400).json({ message: 'Name and email are required' });
+  const { name, email, password, role = 'user' } = req.body || {};
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'Name, email and password are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  }
   if (!['user', 'admin'].includes(role)) {
     return res.status(400).json({ message: 'Invalid role' });
   }
@@ -170,12 +167,11 @@ router.post('/invite', protect, async (req, res) => {
     const exists = await User.findOne({ email: email.toLowerCase() });
     if (exists) return res.status(400).json({ message: 'User with this email already exists' });
 
-    // Create pending user — placeholder password, must be set on activation
-    const placeholder = await bcrypt.hash('PENDING_' + Date.now(), 10);
+    const hashed = await bcrypt.hash(password, 10);
     await User.create({
       name,
       email: email.toLowerCase(),
-      password: placeholder,
+      password: hashed,
       role,
       pendingInvite: true,
     });
@@ -188,7 +184,7 @@ router.post('/invite', protect, async (req, res) => {
 
     return res.json({
       ok: true,
-      message: `Invite OTP sent to ${process.env.ADMIN_EMAIL}`,
+      message: 'Activation code sent to admin email.',
       newUserEmail: email,
     });
   } catch (err) {
@@ -197,14 +193,11 @@ router.post('/invite', protect, async (req, res) => {
   }
 });
 
-/* POST /api/auth-otp/verify-invite   { email, otp, password } */
+/* POST /api/auth-otp/verify-invite   { email, otp } */
 router.post('/verify-invite', async (req, res) => {
-  const { email, otp, password } = req.body || {};
-  if (!email || !otp || !password) {
-    return res.status(400).json({ message: 'Email, code and password are required' });
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  const { email, otp } = req.body || {};
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and code are required' });
   }
 
   try {
@@ -215,14 +208,10 @@ router.post('/verify-invite', async (req, res) => {
     const valid = await consumeOtp(user.email, 'invite', otp);
     if (!valid) return res.status(401).json({ message: 'Invalid or expired code' });
 
-    user.password = await bcrypt.hash(password, 10);
     user.pendingInvite = false;
     await user.save();
 
-    return res.json({
-      user: publicUser(user),
-      token: generateToken(user._id, user.role),
-    });
+    return res.json({ ok: true, email: user.email });
   } catch (err) {
     console.error('[auth-otp verify-invite]', err);
     return res.status(500).json({ message: err.message });
@@ -233,14 +222,12 @@ router.post('/verify-invite', async (req, res) => {
    PASSWORD RESET
    ================================================================== */
 
-/* POST /api/auth-otp/forgot-password   { email } */
 router.post('/forgot-password', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ message: 'Email is required' });
 
   try {
     const user = await User.findOne({ email: email.toLowerCase() });
-    // Always respond OK to avoid leaking which emails exist
     if (!user || user.pendingInvite) return res.json({ ok: true });
 
     const otp = await issueOtp(user.email, 'reset');
@@ -252,7 +239,6 @@ router.post('/forgot-password', async (req, res) => {
   }
 });
 
-/* POST /api/auth-otp/reset-password   { email, otp, newPassword } */
 router.post('/reset-password', async (req, res) => {
   const { email, otp, newPassword } = req.body || {};
   if (!email || !otp || !newPassword) {
