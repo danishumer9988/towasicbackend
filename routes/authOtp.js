@@ -13,7 +13,7 @@ const {
   sendLoginNotification,
 } = require('../utils/mailer');
 
-const OTP_TTL_MS = 10 * 60 * 1000;
+const OTP_TTL_MS = 2 * 60 * 1000; // ⏱ 2 minutes
 
 const generateToken = (id, role) =>
   jwt.sign({ id, role }, process.env.JWT_SECRET, { expiresIn: '30d' });
@@ -87,7 +87,7 @@ const publicUser = (u) => ({
 });
 
 /* ==================================================================
-   LOGIN — 2-step: email+password → OTP → login
+   LOGIN
    ================================================================== */
 
 router.post('/login-start', async (req, res) => {
@@ -125,6 +125,9 @@ router.post('/login-verify', async (req, res) => {
   try {
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ message: 'User not found' });
+    if (user.pendingInvite) {
+      return res.status(403).json({ message: 'Account not activated.' });
+    }
 
     const valid = await consumeOtp(user.email, 'login', otp);
     if (!valid) return res.status(401).json({ message: 'Invalid or expired code' });
@@ -193,7 +196,27 @@ router.post('/invite', protect, async (req, res) => {
   }
 });
 
-/* POST /api/auth-otp/verify-invite   { email, otp } */
+/* Resend a fresh OTP for a pending user — admin only */
+router.post('/resend-invite', protect, async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+
+  try {
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user.pendingInvite) return res.status(400).json({ message: 'User is already activated' });
+
+    const otp = await issueOtp(user.email, 'invite');
+    const sent = await sendInviteOtp(user.name, user.email, otp);
+    if (!sent) return res.status(500).json({ message: 'Failed to send email. Check SMTP settings.' });
+
+    return res.json({ ok: true, message: 'Fresh activation code sent to admin email.' });
+  } catch (err) {
+    console.error('[auth-otp resend-invite]', err);
+    return res.status(500).json({ message: err.message });
+  }
+});
+
 router.post('/verify-invite', async (req, res) => {
   const { email, otp } = req.body || {};
   if (!email || !otp) {

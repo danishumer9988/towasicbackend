@@ -17,9 +17,16 @@ const protect = async (req, res, next) => {
 
       // Get user from the token (exclude password)
       req.user = await User.findById(decoded.id).select('-password');
-      
+
       if (!req.user) {
         return res.status(401).json({ message: 'Not authorized, user not found' });
+      }
+
+      // ─── Block users whose invite hasn't been verified yet ───
+      if (req.user.pendingInvite) {
+        return res.status(403).json({
+          message: 'Account not activated. Please verify with the activation code from your admin.',
+        });
       }
 
       next();

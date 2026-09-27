@@ -11,7 +11,6 @@ const transporter = nodemailer.createTransport({
 const FROM = `"Towasic Solutions" <${process.env.SMTP_USER}>`;
 const ADMIN = process.env.ADMIN_EMAIL;
 
-/* Generic sender — returns true/false, never throws */
 async function sendMail({ to, subject, html, text }) {
   if (!process.env.SMTP_USER || !process.env.SMTP_APP_PASSWORD) {
     console.warn('[mailer] SMTP credentials missing — email not sent.');
@@ -26,7 +25,6 @@ async function sendMail({ to, subject, html, text }) {
   }
 }
 
-/* ---------- Shared layout ---------- */
 const layout = (body) => `
   <div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#111">
     <div style="text-align:center;margin-bottom:24px">
@@ -49,10 +47,9 @@ const otpBlock = (otp) => `
       ${otp}
     </div>
   </div>
-  <p style="color:#6b7280;font-size:13px;text-align:center">This code expires in 10 minutes.</p>
+  <p style="color:#6b7280;font-size:13px;text-align:center">This code expires in 2 minutes.</p>
 `;
 
-/* ---------- Templates ---------- */
 async function sendLoginOtp(to, otp) {
   return sendMail({
     to,
