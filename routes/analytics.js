@@ -2,6 +2,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const router = express.Router();
 
+const { protect } = require('../middleware/auth');
+
 /* ============================================================
    MODELS
    ============================================================ */
@@ -17,7 +19,7 @@ const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoos
   lat:         { type: Number, default: null },
   lon:         { type: Number, default: null },
   accuracy:    { type: Number, default: null },
-  geoSource:   { type: String, default: '' },     // 'gps' | 'ip' | ''
+  geoSource:   { type: String, default: '' },
   device:      { type: String, default: 'desktop' },
   browser:     { type: String, default: 'Other' },
   os:          { type: String, default: 'Other' },
@@ -154,7 +156,7 @@ async function lookupFromIpWhoIs(ip) {
 }
 
 async function lookupGeo(ip, headers = {}) {
-  // 1) Vercel headers (fastest — no external call)
+  // 1) Vercel headers
   const vc = headers['x-vercel-ip-country'];
   if (vc) {
     const city = (headers['x-vercel-ip-city'] || '').replace(/%20/g, ' ');
@@ -177,7 +179,7 @@ async function lookupGeo(ip, headers = {}) {
   const cached = geoCache.get(ip);
   if (cached && Date.now() - cached.ts < GEO_TTL) return cached.data;
 
-  // 4) Fallback providers — try ipapi.co first, then ipwho.is
+  // 4) Fallback providers
   let data = await lookupFromIpApiCo(ip);
   if (!data || !data.country) {
     data = await lookupFromIpWhoIs(ip);
@@ -237,10 +239,6 @@ router.post('/track', async (req, res) => {
     if (type === 'pageview') {
       const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
 
-      /* ----------------------------------------------------------------
-         ALWAYS run IP geo lookup when we don't already have one.
-         This is what makes city/country appear even if the user declines GPS.
-         ---------------------------------------------------------------- */
       let ipGeo = null;
       if (!existing || !existing.country) {
         ipGeo = await lookupGeo(ip, req.headers);
@@ -263,7 +261,6 @@ router.post('/track', async (req, res) => {
         $setOnInsert: { visitor_id: visitorId, first_seen: new Date() },
       };
 
-      // Always set country/region/city from IP when we looked it up
       if (ipGeo) {
         update.$set.country     = ipGeo.country;
         update.$set.countryName = ipGeo.countryName;
@@ -271,7 +268,6 @@ router.post('/track', async (req, res) => {
         update.$set.city        = ipGeo.city;
       }
 
-      // Coordinates: prefer GPS, fall back to IP
       if (hasGps) {
         update.$set.lat       = clientGeo.lat;
         update.$set.lon       = clientGeo.lon;
@@ -574,6 +570,70 @@ router.get('/analytics', async (req, res) => {
   } catch (err) {
     console.error('[analytics] error:', err);
     return res.status(500).json({ error: 'Failed to load analytics' });
+  }
+});
+
+/* ============================================================
+   DELETE — visitor + all related records
+   ============================================================ */
+
+/* DELETE /api/analytics/visitor/:id — single delete */
+router.delete('/analytics/visitor/:id', protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ ok: false, error: 'Missing visitor id' });
+
+    const [v, s, p, a] = await Promise.all([
+      Visitor.deleteOne({ visitor_id: id }),
+      Session.deleteMany({ visitor_id: id }),
+      PageView.deleteMany({ visitor_id: id }),
+      Activity.deleteMany({ visitor_id: id }),
+    ]);
+
+    return res.json({
+      ok: true,
+      deleted: {
+        visitors: v.deletedCount,
+        sessions: s.deletedCount,
+        pageViews: p.deletedCount,
+        activities: a.deletedCount,
+      },
+    });
+  } catch (err) {
+    console.error('[analytics delete] error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* POST /api/analytics/visitors/delete — bulk delete
+   Body: { ids: ['vid1', 'vid2', ...] } */
+router.post('/analytics/visitors/delete', protect, async (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ ok: false, error: 'No visitor IDs provided' });
+    }
+
+    const [v, s, p, a] = await Promise.all([
+      Visitor.deleteMany({ visitor_id: { $in: ids } }),
+      Session.deleteMany({ visitor_id: { $in: ids } }),
+      PageView.deleteMany({ visitor_id: { $in: ids } }),
+      Activity.deleteMany({ visitor_id: { $in: ids } }),
+    ]);
+
+    return res.json({
+      ok: true,
+      deletedCount: ids.length,
+      breakdown: {
+        visitors: v.deletedCount,
+        sessions: s.deletedCount,
+        pageViews: p.deletedCount,
+        activities: a.deletedCount,
+      },
+    });
+  } catch (err) {
+    console.error('[analytics bulk delete] error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
