@@ -8,7 +8,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const BRAND_NAME = 'Towasicsolutions';
+const BRAND_NAME = 'Towasicsolutions Team';
 const BRAND_TEAM = 'Towasicsolutions Team';
 const FROM = `"${BRAND_NAME}" <${process.env.SMTP_USER}>`;
 const ADMIN = process.env.ADMIN_EMAIL;
