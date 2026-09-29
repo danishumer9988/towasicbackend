@@ -8,7 +8,9 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const FROM = `"Towasic Solutions" <${process.env.SMTP_USER}>`;
+const BRAND_NAME = 'Towasicsolutions';
+const BRAND_TEAM = 'Towasicsolutions Team';
+const FROM = `"${BRAND_NAME}" <${process.env.SMTP_USER}>`;
 const ADMIN = process.env.ADMIN_EMAIL;
 
 async function sendMail({ to, subject, html, text }) {
@@ -25,17 +27,21 @@ async function sendMail({ to, subject, html, text }) {
   }
 }
 
+/* ---------- Shared layout ---------- */
 const layout = (body) => `
   <div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#111">
     <div style="text-align:center;margin-bottom:24px">
-      <div style="display:inline-block;background:#0a85a7;color:white;padding:10px 18px;border-radius:12px;font-weight:700;font-size:18px">
-        Towasic Solutions
+      <div style="display:inline-block;background:#0a85a7;color:white;padding:10px 22px;border-radius:12px;font-weight:700;font-size:18px;letter-spacing:0.5px">
+        ${BRAND_NAME}
       </div>
     </div>
     <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;padding:28px">
       ${body}
     </div>
-    <p style="text-align:center;color:#9ca3af;font-size:12px;margin-top:24px">
+    <p style="text-align:center;color:#6b7280;font-size:13px;margin-top:24px;margin-bottom:4px">
+      — The ${BRAND_TEAM}
+    </p>
+    <p style="text-align:center;color:#9ca3af;font-size:12px;margin-top:8px">
       If you didn't request this, please ignore this email.
     </p>
   </div>
@@ -50,11 +56,16 @@ const otpBlock = (otp) => `
   <p style="color:#6b7280;font-size:13px;text-align:center">This code expires in 2 minutes.</p>
 `;
 
+/* ---------- Templates ---------- */
 async function sendLoginOtp(to, otp) {
   return sendMail({
     to,
-    subject: 'Your login code',
-    text: `Your Towasic Solutions login code is: ${otp}`,
+    subject: `${BRAND_NAME} · Your login code`,
+    text:
+      `${BRAND_NAME}\n\n` +
+      `Your login verification code is: ${otp}\n` +
+      `This code expires in 2 minutes.\n\n` +
+      `— The ${BRAND_TEAM}`,
     html: layout(`
       <h2 style="margin:0 0 8px;color:#086B87">Login verification</h2>
       <p style="color:#4b5563;margin:0 0 4px">Use the code below to complete your sign-in:</p>
@@ -66,8 +77,13 @@ async function sendLoginOtp(to, otp) {
 async function sendInviteOtp(newUserName, newUserEmail, otp) {
   return sendMail({
     to: ADMIN,
-    subject: `New user invite: ${newUserEmail}`,
-    text: `You invited ${newUserName} (${newUserEmail}). Their activation code is: ${otp}`,
+    subject: `${BRAND_NAME} · New user invite: ${newUserEmail}`,
+    text:
+      `${BRAND_NAME}\n\n` +
+      `You invited ${newUserName} (${newUserEmail}).\n` +
+      `Their activation code is: ${otp}\n` +
+      `This code expires in 2 minutes.\n\n` +
+      `— The ${BRAND_TEAM}`,
     html: layout(`
       <h2 style="margin:0 0 8px;color:#086B87">New user invite</h2>
       <p style="color:#4b5563;margin:0 0 4px">You are inviting:</p>
@@ -82,8 +98,12 @@ async function sendInviteOtp(newUserName, newUserEmail, otp) {
 async function sendResetOtp(to, otp) {
   return sendMail({
     to,
-    subject: 'Password reset code',
-    text: `Your Towasic Solutions password reset code is: ${otp}`,
+    subject: `${BRAND_NAME} · Password reset code`,
+    text:
+      `${BRAND_NAME}\n\n` +
+      `Your password reset code is: ${otp}\n` +
+      `This code expires in 2 minutes.\n\n` +
+      `— The ${BRAND_TEAM}`,
     html: layout(`
       <h2 style="margin:0 0 8px;color:#086B87">Password reset</h2>
       <p style="color:#4b5563;margin:0 0 4px">Use this code to reset your password:</p>
@@ -111,8 +131,13 @@ async function sendLoginNotification(userEmail, info = {}) {
 
   return sendMail({
     to: ADMIN,
-    subject: `Login alert: ${userEmail}`,
-    text: `New login on ${userEmail}\nIP: ${info.ip}\nTime: ${new Date().toISOString()}`,
+    subject: `${BRAND_NAME} · Login alert: ${userEmail}`,
+    text:
+      `${BRAND_NAME} — New login\n\n` +
+      `Account: ${userEmail}\n` +
+      `IP: ${info.ip || '—'}\n` +
+      `Time: ${new Date().toISOString()}\n\n` +
+      `— The ${BRAND_TEAM}`,
     html: layout(`
       <h2 style="margin:0 0 12px;color:#086B87">New sign-in detected</h2>
       <p style="color:#4b5563;margin:0 0 16px">A user just logged in to your admin panel.</p>
