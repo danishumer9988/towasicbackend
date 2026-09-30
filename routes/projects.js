@@ -3,17 +3,19 @@ const router = express.Router();
 const Project = require('../models/Project');
 const { protect } = require('../middleware/auth');
 
-// @route   GET api/projects
+// GET all projects (optional ?industry=slug filter)
 router.get('/', async (req, res) => {
   try {
-    const projects = await Project.find({}).sort({ projectNumber: 1 });
+    const filter = {};
+    if (req.query.industry) filter.industry = req.query.industry;
+    const projects = await Project.find(filter).sort({ projectNumber: 1 });
     res.json(projects);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET api/projects/:id
+// GET single project by ID
 router.get('/:id', async (req, res) => {
   try {
     const project = await Project.findById(req.params.id);
@@ -24,9 +26,9 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// @route   POST api/projects
+// POST create project
 router.post('/', protect, async (req, res) => {
-  const { projectNumber, title, description, images, link } = req.body;
+  const { projectNumber, title, description, images, link, industry } = req.body;
 
   if (projectNumber === undefined || !title || !description) {
     return res.status(400).json({ message: 'Project number, title, and description are required' });
@@ -38,7 +40,8 @@ router.post('/', protect, async (req, res) => {
       title,
       description,
       link: link || '',
-      images: images || []
+      industry: industry || '',
+      images: images || [],
     });
     res.status(201).json(project);
   } catch (error) {
@@ -46,9 +49,9 @@ router.post('/', protect, async (req, res) => {
   }
 });
 
-// @route   PUT api/projects/:id
+// PUT update project
 router.put('/:id', protect, async (req, res) => {
-  const { projectNumber, title, description, images, link } = req.body;
+  const { projectNumber, title, description, images, link, industry } = req.body;
 
   try {
     const project = await Project.findById(req.params.id);
@@ -59,6 +62,7 @@ router.put('/:id', protect, async (req, res) => {
     if (description !== undefined) project.description = description;
     if (images !== undefined) project.images = images;
     if (link !== undefined) project.link = link;
+    if (industry !== undefined) project.industry = industry;
 
     const updated = await project.save();
     res.json(updated);
@@ -67,7 +71,7 @@ router.put('/:id', protect, async (req, res) => {
   }
 });
 
-// @route   DELETE api/projects/:id
+// DELETE project
 router.delete('/:id', protect, async (req, res) => {
   try {
     const project = await Project.findById(req.params.id);
