@@ -28,7 +28,7 @@ router.get('/:id', async (req, res) => {
 
 // POST create project
 router.post('/', protect, async (req, res) => {
-  const { projectNumber, title, description, images, link, industry } = req.body;
+  const { projectNumber, title, description, images, link, industry, blurImage } = req.body;
 
   if (projectNumber === undefined || !title || !description) {
     return res.status(400).json({ message: 'Project number, title, and description are required' });
@@ -41,6 +41,7 @@ router.post('/', protect, async (req, res) => {
       description,
       link: link || '',
       industry: industry || '',
+      blurImage: !!blurImage,
       images: images || [],
     });
     res.status(201).json(project);
@@ -51,7 +52,7 @@ router.post('/', protect, async (req, res) => {
 
 // PUT update project
 router.put('/:id', protect, async (req, res) => {
-  const { projectNumber, title, description, images, link, industry } = req.body;
+  const { projectNumber, title, description, images, link, industry, blurImage } = req.body;
 
   try {
     const project = await Project.findById(req.params.id);
@@ -63,6 +64,7 @@ router.put('/:id', protect, async (req, res) => {
     if (images !== undefined) project.images = images;
     if (link !== undefined) project.link = link;
     if (industry !== undefined) project.industry = industry;
+    if (blurImage !== undefined) project.blurImage = !!blurImage;
 
     const updated = await project.save();
     res.json(updated);

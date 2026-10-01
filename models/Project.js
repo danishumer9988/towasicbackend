@@ -21,6 +21,10 @@ const ProjectSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  blurImage: {
+    type: Boolean,
+    default: false
+  },
   images: [{
     type: String
   }]
