@@ -17,6 +17,10 @@ const ProjectSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  videoLink: {
+    type: String,
+    default: ''
+  },
   industry: {
     type: String,
     default: ''
