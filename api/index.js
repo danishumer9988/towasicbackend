@@ -31,6 +31,7 @@ app.use('/api/blogs',         require('../routes/blogs'));
 app.use('/api/categories',    require('../routes/categories'));
 app.use('/api/contacts',      require('../routes/contacts'));
 app.use('/api/contact',       require('../routes/contacts'));
+app.use('/api/estimates',     require('../routes/estimates'));
 app.use('/api/subscriptions', require('../routes/subscriptions'));
 app.use('/api/upload',        require('../routes/upload'));
 app.use('/api/projects',      require('../routes/projects'));
