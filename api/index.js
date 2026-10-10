@@ -43,9 +43,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Towasic Solutions Backend is running' });
 });
 
-/* FIX: Only call app.listen() when run directly (local dev via `npm start`).
-   On Vercel serverless, the module is imported and the handler is invoked —
-   calling app.listen() there is unnecessary and can cause cold-start issues. */
+/* Only listen when run directly (local dev). Vercel imports the module. */
 if (require.main === module) {
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
