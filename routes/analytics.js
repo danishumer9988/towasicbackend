@@ -262,17 +262,18 @@ router.post('/track', async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // DECLINED / UNKNOWN → only security log, nothing else
+    // DECLINED → only security log, nothing else
+    // UNKNOWN → nothing at all (user hasn't chosen yet)
     // ---------------------------------------------------------
     if (!hasFullConsent) {
-      if (type === 'pageview') {
+      if (type === 'pageview' && consent === 'declined') {
         await writeSecurityLog({
           ip,
           isBot: false,
-          consent: consent === 'declined' ? 'declined' : 'unknown',
+          consent: 'declined',
         });
       }
-      return res.json({ ok: true, consent, stored: 'security-log' });
+      return res.json({ ok: true, consent, stored: consent === 'declined' ? 'security-log' : 'skipped' });
     }
 
     // ---------------------------------------------------------
