@@ -4,20 +4,23 @@ const router = express.Router();
 
 const { protect } = require('../middleware/auth');
 
-/* Force-clear the model cache so a redeploy always picks up schema changes.
-   Vercel reuses serverless containers, and Mongoose caches models globally. */
-Object.keys(mongoose.models).forEach((k) => {
-  try { delete mongoose.models[k]; } catch (_) {}
-});
+/* ============================================================
+   MODEL DEFINITIONS
+   ------------------------------------------------------------
+   Versioned suffix avoids Mongoose's OverwriteModelError across
+   Vercel cold starts. Bump V whenever you change a schema.
+   ============================================================ */
+const V = 'v4';
+
+function defineModel(name, schema) {
+  const modelName = `${name}_${V}`;
+  return mongoose.models[modelName] || mongoose.model(modelName, schema);
+}
 
 const TTL_90D = 90 * 24 * 60 * 60;
 
-/* ============================================================
-   VISITORS COLLECTION — only for ACCEPTED visitors
-   First insert writes all the data. Subsequent pageviews only
-   update last_seen / last_page. Never creates duplicates.
-   ============================================================ */
-const Visitor = mongoose.model('Visitor', new mongoose.Schema({
+/* ---------- Accepted visitors (full data) ---------- */
+const Visitor = defineModel('Visitor', new mongoose.Schema({
   visitor_id:  { type: String, required: true, unique: true, index: true },
   consent:     { type: String, enum: ['accepted'], default: 'accepted', index: true },
 
@@ -43,12 +46,8 @@ const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   last_seen:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-/* ============================================================
-   SECURITY LOG COLLECTION — for DECLINED and UNKNOWN visitors
-   Exactly 6 fields. Grouped by IP + consent inside a 30-minute
-   window so the same visitor never creates multiple entries.
-   ============================================================ */
-const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
+/* ---------- Declined / Unknown visitors (6 fields only) ---------- */
+const SecurityLog = defineModel('SecurityLog', new mongoose.Schema({
   ip:        { type: String, required: true, index: true },
   timestamp: { type: Date,   default: Date.now, index: true, expires: TTL_90D },
   isBot:     { type: Boolean, default: false },
@@ -57,10 +56,7 @@ const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
   endTime:   { type: Date,   default: Date.now },
 }));
 
-/* ============================================================
-   SESSION / PAGEVIEW / ACTIVITY — only created for accepted users
-   ============================================================ */
-const Session = mongoose.model('Session', new mongoose.Schema({
+const Session = defineModel('Session', new mongoose.Schema({
   session_id:  { type: String, required: true, unique: true, index: true },
   visitor_id:  { type: String, required: true, index: true },
   landing:     { type: String, default: '/' },
@@ -73,7 +69,7 @@ const Session = mongoose.model('Session', new mongoose.Schema({
   ended_at:    { type: Date, default: Date.now },
 }));
 
-const PageView = mongoose.model('PageView', new mongoose.Schema({
+const PageView = defineModel('PageView', new mongoose.Schema({
   visitor_id: { type: String, required: true, index: true },
   session_id: { type: String, required: true, index: true },
   path:       { type: String, default: '/', index: true },
@@ -82,7 +78,7 @@ const PageView = mongoose.model('PageView', new mongoose.Schema({
   timestamp:  { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-const Activity = mongoose.model('Activity', new mongoose.Schema({
+const Activity = defineModel('Activity', new mongoose.Schema({
   visitor_id:  { type: String, required: true, index: true },
   session_id:  { type: String, required: true, index: true },
   type:        { type: String, required: true, index: true },
@@ -230,12 +226,7 @@ const strip = (doc) => {
   return { ...rest, id: _id.toString() };
 };
 
-/* ============================================================
-   WRITE-ONCE: upsert Visitor with $setOnInsert for all immutable
-   fields. If the row already exists, we only refresh activity
-   metadata (last_seen / last_page). IP, geo, device, browser,
-   consent — all set once and never touched again.
-   ============================================================ */
+/* ---------- Accepted visitor: write-once upsert ---------- */
 async function upsertAcceptedVisitor({ visitorId, ip, device, browser, os, page, geo, screen, viewport, clientGeo }) {
   const setOnInsert = {
     visitor_id: visitorId,
@@ -252,7 +243,6 @@ async function upsertAcceptedVisitor({ visitorId, ip, device, browser, os, page,
     setOnInsert.region      = geo.region;
     setOnInsert.city        = geo.city;
   }
-
   if (screen) {
     setOnInsert.sw = screen.w ?? null;
     setOnInsert.sh = screen.h ?? null;
@@ -302,10 +292,7 @@ async function upsertAcceptedVisitor({ visitorId, ip, device, browser, os, page,
   }
 }
 
-/* ============================================================
-   WRITE-ONCE: SecurityLog entry per IP + consent per 30-min window.
-   Never creates duplicates for the same visitor burst.
-   ============================================================ */
+/* ---------- Security log: grouped by IP + consent, 30-min window ---------- */
 async function writeSecurityLog({ ip, isBot, consent }) {
   const cutoff = new Date(Date.now() - 30 * 60 * 1000);
 
@@ -323,7 +310,7 @@ async function writeSecurityLog({ ip, isBot, consent }) {
   return await SecurityLog.create({
     ip,
     isBot,
-    consent,           // 'declined' or 'unknown'
+    consent,
     startTime: new Date(),
     endTime:   new Date(),
     timestamp: new Date(),
@@ -332,6 +319,16 @@ async function writeSecurityLog({ ip, isBot, consent }) {
 
 /* ============================================================
    POST /api/track
+   ------------------------------------------------------------
+   Behavior by (type, consent):
+
+     pageview + accepted  → full tracking (Visitor + Session + PageView)
+     pageview + declined  → SecurityLog row (declined) — immediately
+     pageview + unknown   → SKIP (user still deciding)
+     click    + accepted  → Activity + Session.clicks++
+     click    + *         → SKIP
+     exit     + unknown   → SecurityLog row (unknown) — deferred signal
+     exit     + *         → SKIP (they already chose)
    ============================================================ */
 router.post('/track', async (req, res) => {
   try {
@@ -366,81 +363,103 @@ router.post('/track', async (req, res) => {
     else if (incoming === 'declined') consent = 'declined';
     else                              consent = 'unknown';
 
-    /* ----- ACCEPTED path — full tracking, stored in Visitor collection ----- */
-    if (consent === 'accepted') {
-      const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
-      const geo = existing ? null : await lookupGeo(ip, req.headers);
+    /* ============================================================
+       EXIT SIGNAL — user closing tab without choosing
+       ============================================================ */
+    if (type === 'exit') {
+      if (consent === 'unknown') {
+        await writeSecurityLog({ ip, isBot: false, consent: 'unknown' });
+        return res.json({ ok: true, consent, stored: 'security-log' });
+      }
+      return res.json({ ok: true, consent, stored: 'skipped' });
+    }
 
-      await upsertAcceptedVisitor({
-        visitorId, ip, device, browser, os,
-        page: path, geo, screen, viewport, clientGeo,
-      });
+    /* ============================================================
+       UNKNOWN PAGEVIEWS — don't store, user still deciding
+       ============================================================ */
+    if (consent === 'unknown') {
+      return res.json({ ok: true, consent, stored: 'skipped' });
+    }
 
+    /* ============================================================
+       DECLINED — write SecurityLog immediately, no other tracking
+       ============================================================ */
+    if (consent === 'declined') {
       if (type === 'pageview') {
-        const sess = await Session.findOne({ session_id: sessionId }).lean();
-        if (!sess) {
-          await Session.create({
-            session_id: sessionId, visitor_id: visitorId,
-            landing: path || '/', exit: path || '/',
-            ref_host: hostOf(referrer),
-            page_views: 1, clicks: 0, duration_ms: 0,
-            started_at: new Date(), ended_at: new Date(),
-          });
-        } else {
-          const lastTs = sess.ended_at ? new Date(sess.ended_at).getTime() : Date.now();
-          const idleMs = Math.min(Date.now() - lastTs, 30 * 60 * 1000);
-          const duration = (sess.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
-          await Session.updateOne(
-            { session_id: sessionId },
-            { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
-          );
-        }
+        await writeSecurityLog({ ip, isBot: false, consent: 'declined' });
+      }
+      return res.json({ ok: true, consent, stored: 'security-log' });
+    }
 
-        await PageView.create({
-          visitor_id: visitorId, session_id: sessionId,
-          path: path || '/',
-          title: (title || '').slice(0, 120),
+    /* ============================================================
+       ACCEPTED — full tracking
+       ============================================================ */
+    const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
+    const geo = existing ? null : await lookupGeo(ip, req.headers);
+
+    await upsertAcceptedVisitor({
+      visitorId, ip, device, browser, os,
+      page: path, geo, screen, viewport, clientGeo,
+    });
+
+    if (type === 'pageview') {
+      const sess = await Session.findOne({ session_id: sessionId }).lean();
+      if (!sess) {
+        await Session.create({
+          session_id: sessionId, visitor_id: visitorId,
+          landing: path || '/', exit: path || '/',
           ref_host: hostOf(referrer),
-          timestamp: new Date(),
+          page_views: 1, clicks: 0, duration_ms: 0,
+          started_at: new Date(), ended_at: new Date(),
         });
-      } else if (type === 'click') {
-        const dest = (() => {
-          try { return new URL(destination, 'http://x').pathname; } catch { return destination || ''; }
-        })();
-
-        await Activity.create({
-          visitor_id: visitorId, session_id: sessionId, type: 'click',
-          path: path || '',
-          element: (element || '').slice(0, 16),
-          text: (text || '').slice(0, 60),
-          destination: dest.slice(0, 120),
-          timestamp: new Date(),
-        });
-
+      } else {
+        const lastTs = sess.ended_at ? new Date(sess.ended_at).getTime() : Date.now();
+        const idleMs = Math.min(Date.now() - lastTs, 30 * 60 * 1000);
+        const duration = (sess.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
         await Session.updateOne(
           { session_id: sessionId },
-          {
-            $inc: { clicks: 1 },
-            $set: { ended_at: new Date() },
-            $setOnInsert: {
-              visitor_id: visitorId, landing: path || '/', exit: path || '/',
-              page_views: 0, duration_ms: 0, started_at: new Date(),
-            },
-          },
-          { upsert: true }
+          { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
         );
-      } else {
-        return res.status(400).json({ ok: false, error: 'Unknown type' });
       }
 
-      return res.json({ ok: true, consent, stored: 'full' });
+      await PageView.create({
+        visitor_id: visitorId, session_id: sessionId,
+        path: path || '/',
+        title: (title || '').slice(0, 120),
+        ref_host: hostOf(referrer),
+        timestamp: new Date(),
+      });
+    } else if (type === 'click') {
+      const dest = (() => {
+        try { return new URL(destination, 'http://x').pathname; } catch { return destination || ''; }
+      })();
+
+      await Activity.create({
+        visitor_id: visitorId, session_id: sessionId, type: 'click',
+        path: path || '',
+        element: (element || '').slice(0, 16),
+        text: (text || '').slice(0, 60),
+        destination: dest.slice(0, 120),
+        timestamp: new Date(),
+      });
+
+      await Session.updateOne(
+        { session_id: sessionId },
+        {
+          $inc: { clicks: 1 },
+          $set: { ended_at: new Date() },
+          $setOnInsert: {
+            visitor_id: visitorId, landing: path || '/', exit: path || '/',
+            page_views: 0, duration_ms: 0, started_at: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    } else {
+      return res.status(400).json({ ok: false, error: 'Unknown type' });
     }
 
-    /* ----- DECLINED / UNKNOWN path — only SecurityLog, only 6 fields ----- */
-    if (type === 'pageview') {
-      await writeSecurityLog({ ip, isBot: false, consent });
-    }
-    return res.json({ ok: true, consent, stored: 'security-log' });
+    return res.json({ ok: true, consent, stored: 'full' });
   } catch (err) {
     console.error('[track] error:', err);
     return res.status(500).json({ ok: false });
@@ -501,15 +520,12 @@ router.get('/analytics', protect, async (req, res) => {
         returningVisitors:   Math.max(0, newVs[1] - newVs[0]),
         avgPagesPerSession:  +(avgPerSession[0]?.avgPages  || 0).toFixed(2),
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
-
-        // aliases for backward compat
         consentAccepted: uv,
         consentDeclined: declinedCount,
         consentUnknown:  unknownCount,
       });
     }
 
-    /* ---------- TIMESERIES ---------- */
     if (type === 'timeseries') {
       const rows = await PageView.aggregate([
         { $match: { timestamp: bounds } },
@@ -524,7 +540,7 @@ router.get('/analytics', protect, async (req, res) => {
       return res.json(rows);
     }
 
-    /* ---------- VISITORS — accepted visitors only ---------- */
+    /* ---------- VISITORS — accepted only ---------- */
     if (type === 'visitors') {
       const q = (req.query.q || '').trim();
       const filter = { last_seen: bounds };
@@ -562,10 +578,16 @@ router.get('/analytics', protect, async (req, res) => {
       })));
     }
 
-    /* ---------- SECURITY LOG — declined + unknown entries ---------- */
+    /* ---------- SECURITY LOG ---------- */
     if (type === 'security-log') {
+      const consentFilter = req.query.consent; // 'declined' | 'unknown'
+      const filter = { timestamp: bounds };
+      if (consentFilter === 'declined' || consentFilter === 'unknown') {
+        filter.consent = consentFilter;
+      }
+
       const logs = await SecurityLog
-        .find({ timestamp: bounds })
+        .find(filter)
         .sort({ timestamp: -1 })
         .limit(500)
         .lean();
@@ -578,7 +600,6 @@ router.get('/analytics', protect, async (req, res) => {
       })));
     }
 
-    /* ---------- SINGLE VISITOR (only accepted) ---------- */
     if (type === 'visitor') {
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'Missing id' });
@@ -605,7 +626,6 @@ router.get('/analytics', protect, async (req, res) => {
       });
     }
 
-    /* ---------- BREAKDOWNS ---------- */
     if (type === 'breakdowns') {
       const [
         devices, browsers, os, topPages, referrers,
@@ -684,7 +704,6 @@ router.get('/analytics', protect, async (req, res) => {
       });
     }
 
-    /* ---------- CONSENT BREAKDOWN ---------- */
     if (type === 'consent-breakdown') {
       const [accepted, declined, unknown] = await Promise.all([
         Visitor.countDocuments({ last_seen: bounds }),
@@ -702,7 +721,7 @@ router.get('/analytics', protect, async (req, res) => {
 });
 
 /* ============================================================
-   DELETE — accepted visitor
+   DELETE endpoints
    ============================================================ */
 router.delete('/analytics/visitor/:id', protect, async (req, res) => {
   try {
@@ -756,9 +775,6 @@ router.post('/analytics/visitors/delete', protect, async (req, res) => {
   }
 });
 
-/* ============================================================
-   DELETE — security log entry (declined / unknown)
-   ============================================================ */
 router.delete('/analytics/security-log/:id', protect, async (req, res) => {
   try {
     const result = await SecurityLog.deleteOne({ _id: req.params.id });
