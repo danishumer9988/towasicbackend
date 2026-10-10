@@ -5,22 +5,21 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 
 /* ============================================================
-   MODEL DEFINITIONS
-   ------------------------------------------------------------
-   Versioned suffix avoids Mongoose's OverwriteModelError across
-   Vercel cold starts. Bump V whenever you change a schema.
+   Clear cached Mongoose models so schema changes take effect
+   after each redeploy. Vercel reuses Node processes across
+   invocations; without this an old schema can persist even
+   after a fresh build.
    ============================================================ */
-const V = 'v4';
-
-function defineModel(name, schema) {
-  const modelName = `${name}_${V}`;
-  return mongoose.models[modelName] || mongoose.model(modelName, schema);
-}
+['Visitor', 'SecurityLog', 'Session', 'PageView', 'Activity'].forEach((name) => {
+  if (mongoose.models[name]) {
+    try { delete mongoose.models[name]; } catch (_) {}
+  }
+});
 
 const TTL_90D = 90 * 24 * 60 * 60;
 
 /* ---------- Accepted visitors (full data) ---------- */
-const Visitor = defineModel('Visitor', new mongoose.Schema({
+const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   visitor_id:  { type: String, required: true, unique: true, index: true },
   consent:     { type: String, enum: ['accepted'], default: 'accepted', index: true },
 
@@ -47,7 +46,7 @@ const Visitor = defineModel('Visitor', new mongoose.Schema({
 }));
 
 /* ---------- Declined / Unknown visitors (6 fields only) ---------- */
-const SecurityLog = defineModel('SecurityLog', new mongoose.Schema({
+const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
   ip:        { type: String, required: true, index: true },
   timestamp: { type: Date,   default: Date.now, index: true, expires: TTL_90D },
   isBot:     { type: Boolean, default: false },
@@ -56,7 +55,7 @@ const SecurityLog = defineModel('SecurityLog', new mongoose.Schema({
   endTime:   { type: Date,   default: Date.now },
 }));
 
-const Session = defineModel('Session', new mongoose.Schema({
+const Session = mongoose.model('Session', new mongoose.Schema({
   session_id:  { type: String, required: true, unique: true, index: true },
   visitor_id:  { type: String, required: true, index: true },
   landing:     { type: String, default: '/' },
@@ -69,7 +68,7 @@ const Session = defineModel('Session', new mongoose.Schema({
   ended_at:    { type: Date, default: Date.now },
 }));
 
-const PageView = defineModel('PageView', new mongoose.Schema({
+const PageView = mongoose.model('PageView', new mongoose.Schema({
   visitor_id: { type: String, required: true, index: true },
   session_id: { type: String, required: true, index: true },
   path:       { type: String, default: '/', index: true },
@@ -78,7 +77,7 @@ const PageView = defineModel('PageView', new mongoose.Schema({
   timestamp:  { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-const Activity = defineModel('Activity', new mongoose.Schema({
+const Activity = mongoose.model('Activity', new mongoose.Schema({
   visitor_id:  { type: String, required: true, index: true },
   session_id:  { type: String, required: true, index: true },
   type:        { type: String, required: true, index: true },
@@ -134,7 +133,7 @@ const isPrivateIp = (ip) => {
   return false;
 };
 
-async function fetchWithTimeout(url, options = {}, ms = 3000) {
+async function fetchWithTimeout(url, options = {}, ms = 2500) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
@@ -319,16 +318,6 @@ async function writeSecurityLog({ ip, isBot, consent }) {
 
 /* ============================================================
    POST /api/track
-   ------------------------------------------------------------
-   Behavior by (type, consent):
-
-     pageview + accepted  → full tracking (Visitor + Session + PageView)
-     pageview + declined  → SecurityLog row (declined) — immediately
-     pageview + unknown   → SKIP (user still deciding)
-     click    + accepted  → Activity + Session.clicks++
-     click    + *         → SKIP
-     exit     + unknown   → SecurityLog row (unknown) — deferred signal
-     exit     + *         → SKIP (they already chose)
    ============================================================ */
 router.post('/track', async (req, res) => {
   try {
@@ -340,6 +329,7 @@ router.post('/track', async (req, res) => {
     } = d;
 
     if (!visitorId || !sessionId || !type) {
+      console.log('[track] missing fields:', { visitorId, sessionId, type });
       return res.status(400).json({ ok: false, error: 'Missing required fields' });
     }
 
@@ -352,7 +342,6 @@ router.post('/track', async (req, res) => {
 
     if (isBot) return res.json({ ok: true, skipped: 'bot' });
 
-    /* ----- Normalize incoming consent to one of three values ----- */
     let incoming = rawConsent;
     if (incoming === true)  incoming = 'accepted';
     if (incoming === false) incoming = 'declined';
@@ -363,9 +352,9 @@ router.post('/track', async (req, res) => {
     else if (incoming === 'declined') consent = 'declined';
     else                              consent = 'unknown';
 
-    /* ============================================================
-       EXIT SIGNAL — user closing tab without choosing
-       ============================================================ */
+    console.log(`[track] type=${type} consent=${consent} ip=${ip} vid=${String(visitorId).slice(0, 18)}`);
+
+    /* ---- EXIT signal (user closed tab without choosing) ---- */
     if (type === 'exit') {
       if (consent === 'unknown') {
         await writeSecurityLog({ ip, isBot: false, consent: 'unknown' });
@@ -374,16 +363,12 @@ router.post('/track', async (req, res) => {
       return res.json({ ok: true, consent, stored: 'skipped' });
     }
 
-    /* ============================================================
-       UNKNOWN PAGEVIEWS — don't store, user still deciding
-       ============================================================ */
+    /* ---- UNKNOWN pageview — don't store yet ---- */
     if (consent === 'unknown') {
       return res.json({ ok: true, consent, stored: 'skipped' });
     }
 
-    /* ============================================================
-       DECLINED — write SecurityLog immediately, no other tracking
-       ============================================================ */
+    /* ---- DECLINED — write SecurityLog immediately ---- */
     if (consent === 'declined') {
       if (type === 'pageview') {
         await writeSecurityLog({ ip, isBot: false, consent: 'declined' });
@@ -391,9 +376,7 @@ router.post('/track', async (req, res) => {
       return res.json({ ok: true, consent, stored: 'security-log' });
     }
 
-    /* ============================================================
-       ACCEPTED — full tracking
-       ============================================================ */
+    /* ---- ACCEPTED — full tracking ---- */
     const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
     const geo = existing ? null : await lookupGeo(ip, req.headers);
 
@@ -462,7 +445,7 @@ router.post('/track', async (req, res) => {
     return res.json({ ok: true, consent, stored: 'full' });
   } catch (err) {
     console.error('[track] error:', err);
-    return res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -580,7 +563,7 @@ router.get('/analytics', protect, async (req, res) => {
 
     /* ---------- SECURITY LOG ---------- */
     if (type === 'security-log') {
-      const consentFilter = req.query.consent; // 'declined' | 'unknown'
+      const consentFilter = req.query.consent;
       const filter = { timestamp: bounds };
       if (consentFilter === 'declined' || consentFilter === 'unknown') {
         filter.consent = consentFilter;
@@ -600,6 +583,7 @@ router.get('/analytics', protect, async (req, res) => {
       })));
     }
 
+    /* ---------- SINGLE VISITOR ---------- */
     if (type === 'visitor') {
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'Missing id' });
@@ -626,6 +610,7 @@ router.get('/analytics', protect, async (req, res) => {
       });
     }
 
+    /* ---------- BREAKDOWNS ---------- */
     if (type === 'breakdowns') {
       const [
         devices, browsers, os, topPages, referrers,
@@ -716,7 +701,7 @@ router.get('/analytics', protect, async (req, res) => {
     return res.status(400).json({ error: 'Unknown type' });
   } catch (err) {
     console.error('[analytics] error:', err);
-    return res.status(500).json({ error: 'Failed to load analytics' });
+    return res.status(500).json({ error: 'Failed to load analytics', detail: err.message });
   }
 });
 
@@ -796,6 +781,39 @@ router.post('/analytics/security-log/bulk-delete', protect, async (req, res) => 
   } catch (err) {
     console.error('[security-log bulk delete] error:', err);
     return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ============================================================
+   DEBUG — temporary. Remove after verification.
+   ============================================================ */
+router.get('/debug-analytics', async (req, res) => {
+  try {
+    const [
+      visitorCount, securityLogCount,
+      accepted, declined, unknown,
+      recentVisitors, recentLogs,
+    ] = await Promise.all([
+      Visitor.countDocuments({}),
+      SecurityLog.countDocuments({}),
+      Visitor.countDocuments({ consent: 'accepted' }),
+      SecurityLog.countDocuments({ consent: 'declined' }),
+      SecurityLog.countDocuments({ consent: 'unknown' }),
+      Visitor.find({}).sort({ last_seen: -1 }).limit(5).lean(),
+      SecurityLog.find({}).sort({ timestamp: -1 }).limit(5).lean(),
+    ]);
+    res.json({
+      counts: { visitorCount, securityLogCount, accepted, declined, unknown },
+      recentVisitors: recentVisitors.map(v => ({
+        visitor_id: v.visitor_id, consent: v.consent, last_seen: v.last_seen,
+        ip: v.ip, country: v.country, city: v.city,
+      })),
+      recentLogs: recentLogs.map(l => ({
+        ip: l.ip, consent: l.consent, timestamp: l.timestamp,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
