@@ -12,11 +12,14 @@ Object.keys(mongoose.models).forEach((k) => {
 
 const TTL_90D = 90 * 24 * 60 * 60;
 
-/* ---------- Visitor — one row for every visitor (accepted, declined, unknown) ---------- */
+/* ============================================================
+   VISITORS COLLECTION — only for ACCEPTED visitors
+   First insert writes all the data. Subsequent pageviews only
+   update last_seen / last_page. Never creates duplicates.
+   ============================================================ */
 const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   visitor_id:  { type: String, required: true, unique: true, index: true },
-  // Three-way: accepted, declined, or unknown (user hasn't chosen / hasn't been asked)
-  consent:     { type: String, enum: ['accepted', 'declined', 'unknown'], default: 'unknown', index: true },
+  consent:     { type: String, enum: ['accepted'], default: 'accepted', index: true },
 
   ip:          { type: String, default: '' },
   country:     { type: String, default: '' },
@@ -40,16 +43,23 @@ const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   last_seen:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-/* ---------- Security log — activity trail for declined + unknown users ---------- */
+/* ============================================================
+   SECURITY LOG COLLECTION — for DECLINED and UNKNOWN visitors
+   Exactly 6 fields. Grouped by IP + consent inside a 30-minute
+   window so the same visitor never creates multiple entries.
+   ============================================================ */
 const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
   ip:        { type: String, required: true, index: true },
+  timestamp: { type: Date,   default: Date.now, index: true, expires: TTL_90D },
   isBot:     { type: Boolean, default: false },
-  consent:   { type: String, enum: ['declined', 'unknown'], default: 'declined', index: true },
-  startTime: { type: Date, default: Date.now },
-  endTime:   { type: Date, default: Date.now },
-  timestamp: { type: Date, default: Date.now, index: true, expires: TTL_90D },
+  consent:   { type: String, enum: ['declined', 'unknown'], required: true, index: true },
+  startTime: { type: Date,   default: Date.now },
+  endTime:   { type: Date,   default: Date.now },
 }));
 
+/* ============================================================
+   SESSION / PAGEVIEW / ACTIVITY — only created for accepted users
+   ============================================================ */
 const Session = mongoose.model('Session', new mongoose.Schema({
   session_id:  { type: String, required: true, unique: true, index: true },
   visitor_id:  { type: String, required: true, index: true },
@@ -220,17 +230,82 @@ const strip = (doc) => {
   return { ...rest, id: _id.toString() };
 };
 
-async function safeUpsertVisitor(filter, update) {
+/* ============================================================
+   WRITE-ONCE: upsert Visitor with $setOnInsert for all immutable
+   fields. If the row already exists, we only refresh activity
+   metadata (last_seen / last_page). IP, geo, device, browser,
+   consent — all set once and never touched again.
+   ============================================================ */
+async function upsertAcceptedVisitor({ visitorId, ip, device, browser, os, page, geo, screen, viewport, clientGeo }) {
+  const setOnInsert = {
+    visitor_id: visitorId,
+    consent:    'accepted',
+    ip, device, browser, os,
+    first_seen: new Date(),
+  };
+
+  if (page) setOnInsert.last_page = page.slice(0, 120);
+
+  if (geo) {
+    setOnInsert.country     = geo.country;
+    setOnInsert.countryName = geo.countryName;
+    setOnInsert.region      = geo.region;
+    setOnInsert.city        = geo.city;
+  }
+
+  if (screen) {
+    setOnInsert.sw = screen.w ?? null;
+    setOnInsert.sh = screen.h ?? null;
+  }
+  if (viewport) {
+    setOnInsert.vw = viewport.w ?? null;
+    setOnInsert.vh = viewport.h ?? null;
+  }
+
+  const hasGps = clientGeo
+    && typeof clientGeo.lat === 'number'
+    && typeof clientGeo.lon === 'number';
+
+  if (hasGps) {
+    setOnInsert.lat       = clientGeo.lat;
+    setOnInsert.lon       = clientGeo.lon;
+    setOnInsert.accuracy  = typeof clientGeo.accuracy === 'number' ? clientGeo.accuracy : null;
+    setOnInsert.geoSource = 'gps';
+  } else if (geo && geo.lat !== null && geo.lon !== null) {
+    setOnInsert.lat       = geo.lat;
+    setOnInsert.lon       = geo.lon;
+    setOnInsert.accuracy  = null;
+    setOnInsert.geoSource = 'ip';
+  }
+
+  const update = {
+    $set: { last_seen: new Date() },
+    $setOnInsert: setOnInsert,
+  };
+  if (page) update.$set.last_page = page.slice(0, 120);
+
   try {
-    return await Visitor.findOneAndUpdate(filter, update, { upsert: true, new: true });
+    return await Visitor.findOneAndUpdate(
+      { visitor_id: visitorId },
+      update,
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
   } catch (err) {
     if (err && err.code === 11000) {
-      return await Visitor.findOneAndUpdate(filter, { $set: update.$set }, { new: true });
+      return await Visitor.findOneAndUpdate(
+        { visitor_id: visitorId },
+        { $set: update.$set },
+        { new: true }
+      );
     }
     throw err;
   }
 }
 
+/* ============================================================
+   WRITE-ONCE: SecurityLog entry per IP + consent per 30-min window.
+   Never creates duplicates for the same visitor burst.
+   ============================================================ */
 async function writeSecurityLog({ ip, isBot, consent }) {
   const cutoff = new Date(Date.now() - 30 * 60 * 1000);
 
@@ -242,23 +317,21 @@ async function writeSecurityLog({ ip, isBot, consent }) {
     existing.endTime   = new Date();
     existing.timestamp = new Date();
     await existing.save();
-  } else {
-    await SecurityLog.create({
-      ip, isBot, consent,
-      startTime: new Date(), endTime: new Date(), timestamp: new Date(),
-    });
+    return existing;
   }
+
+  return await SecurityLog.create({
+    ip,
+    isBot,
+    consent,           // 'declined' or 'unknown'
+    startTime: new Date(),
+    endTime:   new Date(),
+    timestamp: new Date(),
+  });
 }
 
 /* ============================================================
    POST /api/track
-   ------------------------------------------------------------
-   Consent logic:
-     • incoming === 'accepted'              → accepted (full tracking)
-     • incoming === 'declined'              → declined (limited)
-     • anything else (unknown / missing)    → unknown  (limited)
-   Every visitor gets a Visitor row — even unknown ones.
-   Only accepted visitors get sessions / pageviews / clicks.
    ============================================================ */
 router.post('/track', async (req, res) => {
   try {
@@ -289,135 +362,85 @@ router.post('/track', async (req, res) => {
     if (typeof incoming === 'string') incoming = incoming.toLowerCase();
 
     let consent;
-    if (incoming === 'accepted') consent = 'accepted';
+    if (incoming === 'accepted')      consent = 'accepted';
     else if (incoming === 'declined') consent = 'declined';
-    else consent = 'unknown';
+    else                              consent = 'unknown';
 
-    const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
-
-    /* If a user previously accepted and now sends no consent, keep them accepted */
-    if (consent === 'unknown' && existing?.consent === 'accepted') consent = 'accepted';
-
-    /* ---------- Base update (all consent types) ---------- */
-    const update = {
-      $set: {
-        ip, device, browser, os,
-        consent,
-        last_seen: new Date(),
-      },
-      $setOnInsert: {
-        visitor_id: visitorId,
-        first_seen: new Date(),
-      },
-    };
-
-    if (type === 'pageview' && path) {
-      update.$set.last_page = path.slice(0, 120);
-    }
-
-    /* Geo lookup — only on first sight, IP-based for all consent types */
-    if (!existing) {
-      const ipGeo = await lookupGeo(ip, req.headers);
-      if (ipGeo) {
-        update.$set.country     = ipGeo.country;
-        update.$set.countryName = ipGeo.countryName;
-        update.$set.region      = ipGeo.region;
-        update.$set.city        = ipGeo.city;
-        if (ipGeo.lat !== null && ipGeo.lon !== null) {
-          update.$set.lat       = ipGeo.lat;
-          update.$set.lon       = ipGeo.lon;
-          update.$set.geoSource = 'ip';
-        }
-      }
-    }
-
-    /* Extra fields only for ACCEPTED visitors */
+    /* ----- ACCEPTED path — full tracking, stored in Visitor collection ----- */
     if (consent === 'accepted') {
-      update.$set.sw = screen?.w ?? null;
-      update.$set.sh = screen?.h ?? null;
-      update.$set.vw = viewport?.w ?? null;
-      update.$set.vh = viewport?.h ?? null;
+      const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
+      const geo = existing ? null : await lookupGeo(ip, req.headers);
 
-      const hasGps = clientGeo
-        && typeof clientGeo.lat === 'number'
-        && typeof clientGeo.lon === 'number';
-      if (hasGps) {
-        update.$set.lat       = clientGeo.lat;
-        update.$set.lon       = clientGeo.lon;
-        update.$set.accuracy  = typeof clientGeo.accuracy === 'number' ? clientGeo.accuracy : null;
-        update.$set.geoSource = 'gps';
-      }
-    }
+      await upsertAcceptedVisitor({
+        visitorId, ip, device, browser, os,
+        page: path, geo, screen, viewport, clientGeo,
+      });
 
-    await safeUpsertVisitor({ visitor_id: visitorId }, update);
-
-    /* ---------- Declined / Unknown: security log only ---------- */
-    if (consent !== 'accepted') {
       if (type === 'pageview') {
-        await writeSecurityLog({ ip, isBot: false, consent });
-      }
-      return res.json({ ok: true, consent, stored: 'minimal' });
-    }
+        const sess = await Session.findOne({ session_id: sessionId }).lean();
+        if (!sess) {
+          await Session.create({
+            session_id: sessionId, visitor_id: visitorId,
+            landing: path || '/', exit: path || '/',
+            ref_host: hostOf(referrer),
+            page_views: 1, clicks: 0, duration_ms: 0,
+            started_at: new Date(), ended_at: new Date(),
+          });
+        } else {
+          const lastTs = sess.ended_at ? new Date(sess.ended_at).getTime() : Date.now();
+          const idleMs = Math.min(Date.now() - lastTs, 30 * 60 * 1000);
+          const duration = (sess.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
+          await Session.updateOne(
+            { session_id: sessionId },
+            { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
+          );
+        }
 
-    /* ---------- Accepted: full tracking ---------- */
-    if (type === 'pageview') {
-      const sess = await Session.findOne({ session_id: sessionId }).lean();
-      if (!sess) {
-        await Session.create({
-          session_id: sessionId, visitor_id: visitorId,
-          landing: path || '/', exit: path || '/',
+        await PageView.create({
+          visitor_id: visitorId, session_id: sessionId,
+          path: path || '/',
+          title: (title || '').slice(0, 120),
           ref_host: hostOf(referrer),
-          page_views: 1, clicks: 0, duration_ms: 0,
-          started_at: new Date(), ended_at: new Date(),
+          timestamp: new Date(),
         });
-      } else {
-        const lastTs = sess.ended_at ? new Date(sess.ended_at).getTime() : Date.now();
-        const idleMs = Math.min(Date.now() - lastTs, 30 * 60 * 1000);
-        const duration = (sess.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
+      } else if (type === 'click') {
+        const dest = (() => {
+          try { return new URL(destination, 'http://x').pathname; } catch { return destination || ''; }
+        })();
+
+        await Activity.create({
+          visitor_id: visitorId, session_id: sessionId, type: 'click',
+          path: path || '',
+          element: (element || '').slice(0, 16),
+          text: (text || '').slice(0, 60),
+          destination: dest.slice(0, 120),
+          timestamp: new Date(),
+        });
+
         await Session.updateOne(
           { session_id: sessionId },
-          { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
+          {
+            $inc: { clicks: 1 },
+            $set: { ended_at: new Date() },
+            $setOnInsert: {
+              visitor_id: visitorId, landing: path || '/', exit: path || '/',
+              page_views: 0, duration_ms: 0, started_at: new Date(),
+            },
+          },
+          { upsert: true }
         );
+      } else {
+        return res.status(400).json({ ok: false, error: 'Unknown type' });
       }
 
-      await PageView.create({
-        visitor_id: visitorId, session_id: sessionId,
-        path: path || '/',
-        title: (title || '').slice(0, 120),
-        ref_host: hostOf(referrer),
-        timestamp: new Date(),
-      });
-    } else if (type === 'click') {
-      const dest = (() => {
-        try { return new URL(destination, 'http://x').pathname; } catch { return destination || ''; }
-      })();
-
-      await Activity.create({
-        visitor_id: visitorId, session_id: sessionId, type: 'click',
-        path: path || '',
-        element: (element || '').slice(0, 16),
-        text: (text || '').slice(0, 60),
-        destination: dest.slice(0, 120),
-        timestamp: new Date(),
-      });
-
-      await Session.updateOne(
-        { session_id: sessionId },
-        {
-          $inc: { clicks: 1 },
-          $set: { ended_at: new Date() },
-          $setOnInsert: {
-            visitor_id: visitorId, landing: path || '/', exit: path || '/',
-            page_views: 0, duration_ms: 0, started_at: new Date(),
-          },
-        },
-        { upsert: true }
-      );
-    } else {
-      return res.status(400).json({ ok: false, error: 'Unknown type' });
+      return res.json({ ok: true, consent, stored: 'full' });
     }
 
-    return res.json({ ok: true, consent, stored: 'full' });
+    /* ----- DECLINED / UNKNOWN path — only SecurityLog, only 6 fields ----- */
+    if (type === 'pageview') {
+      await writeSecurityLog({ ip, isBot: false, consent });
+    }
+    return res.json({ ok: true, consent, stored: 'security-log' });
   } catch (err) {
     console.error('[track] error:', err);
     return res.status(500).json({ ok: false });
@@ -438,13 +461,10 @@ router.get('/analytics', protect, async (req, res) => {
       const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
 
       const [
-        uv, acceptedCount, declinedCount, unknownCount,
-        ss, pv, cl, avgRow, activeNow, bounced, newVs, avgPerSession,
+        uv, ss, pv, cl, avgRow, activeNow, bounced, newVs, avgPerSession,
+        declinedCount, unknownCount,
       ] = await Promise.all([
         Visitor.countDocuments({ last_seen: bounds }),
-        Visitor.countDocuments({ last_seen: bounds, consent: 'accepted' }),
-        Visitor.countDocuments({ last_seen: bounds, consent: 'declined' }),
-        Visitor.countDocuments({ last_seen: bounds, consent: 'unknown' }),
         Session.countDocuments({ started_at: bounds }),
         PageView.countDocuments({ timestamp: bounds }),
         Activity.countDocuments({ type: 'click', timestamp: bounds }),
@@ -462,11 +482,13 @@ router.get('/analytics', protect, async (req, res) => {
           { $match: { started_at: bounds } },
           { $group: { _id: null, avgPages: { $avg: '$page_views' }, avgClicks: { $avg: '$clicks' } } },
         ]),
+        SecurityLog.countDocuments({ timestamp: bounds, consent: 'declined' }),
+        SecurityLog.countDocuments({ timestamp: bounds, consent: 'unknown' }),
       ]);
 
       return res.json({
         uniqueVisitors:      uv,
-        acceptedVisitors:    acceptedCount,
+        acceptedVisitors:    uv,
         declinedVisitors:    declinedCount,
         unknownVisitors:     unknownCount,
         sessions:            ss,
@@ -480,8 +502,8 @@ router.get('/analytics', protect, async (req, res) => {
         avgPagesPerSession:  +(avgPerSession[0]?.avgPages  || 0).toFixed(2),
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
 
-        // aliases kept for backward compat
-        consentAccepted: acceptedCount,
+        // aliases for backward compat
+        consentAccepted: uv,
         consentDeclined: declinedCount,
         consentUnknown:  unknownCount,
       });
@@ -502,15 +524,10 @@ router.get('/analytics', protect, async (req, res) => {
       return res.json(rows);
     }
 
-    /* ---------- VISITORS — returns all three types, filterable by ?consent= ---------- */
+    /* ---------- VISITORS — accepted visitors only ---------- */
     if (type === 'visitors') {
       const q = (req.query.q || '').trim();
-      const consentFilter = req.query.consent; // optional: 'accepted' | 'declined' | 'unknown'
-
       const filter = { last_seen: bounds };
-      if (consentFilter === 'accepted' || consentFilter === 'declined' || consentFilter === 'unknown') {
-        filter.consent = consentFilter;
-      }
       if (q) {
         const like = new RegExp(q, 'i');
         filter.$or = [
@@ -541,11 +558,27 @@ router.get('/analytics', protect, async (req, res) => {
         sessions:   aggMap[v.visitor_id]?.sessions || 0,
         pages:      aggMap[v.visitor_id]?.pages    || 0,
         clicks:     aggMap[v.visitor_id]?.clicks   || 0,
-        consent:    v.consent || 'unknown',
+        consent:    'accepted',
       })));
     }
 
-    /* ---------- SINGLE VISITOR ---------- */
+    /* ---------- SECURITY LOG — declined + unknown entries ---------- */
+    if (type === 'security-log') {
+      const logs = await SecurityLog
+        .find({ timestamp: bounds })
+        .sort({ timestamp: -1 })
+        .limit(500)
+        .lean();
+
+      return res.json(logs.map((l) => ({
+        ...strip(l),
+        durationMs: l.endTime && l.startTime
+          ? new Date(l.endTime).getTime() - new Date(l.startTime).getTime()
+          : 0,
+      })));
+    }
+
+    /* ---------- SINGLE VISITOR (only accepted) ---------- */
     if (type === 'visitor') {
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'Missing id' });
@@ -564,7 +597,7 @@ router.get('/analytics', protect, async (req, res) => {
           ...strip(visitor),
           screen_w:   visitor.sw, screen_h: visitor.sh,
           viewport_w: visitor.vw, viewport_h: visitor.vh,
-          consent:    visitor.consent || 'unknown',
+          consent:    'accepted',
         },
         sessions:   sessions.map((s) => ({ ...strip(s), landing_page: s.landing, exit_page: s.exit })),
         pageViews:  pageViews.map(strip),
@@ -651,28 +684,12 @@ router.get('/analytics', protect, async (req, res) => {
       });
     }
 
-    /* ---------- SECURITY LOG (declined + unknown activity trail) ---------- */
-    if (type === 'security-log') {
-      const logs = await SecurityLog
-        .find({ timestamp: bounds })
-        .sort({ timestamp: -1 })
-        .limit(500)
-        .lean();
-
-      return res.json(logs.map((l) => ({
-        ...strip(l),
-        durationMs: l.endTime && l.startTime
-          ? new Date(l.endTime).getTime() - new Date(l.startTime).getTime()
-          : 0,
-      })));
-    }
-
     /* ---------- CONSENT BREAKDOWN ---------- */
     if (type === 'consent-breakdown') {
       const [accepted, declined, unknown] = await Promise.all([
-        Visitor.countDocuments({ last_seen: bounds, consent: 'accepted' }),
-        Visitor.countDocuments({ last_seen: bounds, consent: 'declined' }),
-        Visitor.countDocuments({ last_seen: bounds, consent: 'unknown' }),
+        Visitor.countDocuments({ last_seen: bounds }),
+        SecurityLog.countDocuments({ timestamp: bounds, consent: 'declined' }),
+        SecurityLog.countDocuments({ timestamp: bounds, consent: 'unknown' }),
       ]);
       return res.json({ accepted, declined, unknown });
     }
@@ -685,7 +702,7 @@ router.get('/analytics', protect, async (req, res) => {
 });
 
 /* ============================================================
-   DELETE
+   DELETE — accepted visitor
    ============================================================ */
 router.delete('/analytics/visitor/:id', protect, async (req, res) => {
   try {
@@ -739,6 +756,9 @@ router.post('/analytics/visitors/delete', protect, async (req, res) => {
   }
 });
 
+/* ============================================================
+   DELETE — security log entry (declined / unknown)
+   ============================================================ */
 router.delete('/analytics/security-log/:id', protect, async (req, res) => {
   try {
     const result = await SecurityLog.deleteOne({ _id: req.params.id });
