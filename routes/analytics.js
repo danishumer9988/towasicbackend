@@ -7,12 +7,11 @@ const { protect } = require('../middleware/auth');
 /* ============================================================
    MODELS
    ============================================================ */
-const TTL_90D = 90 * 24 * 60 * 60;
+const TTL_90D = 90 * 24 * 60 * 60;   // 90 days (3 months) — used for all collections
 
+/* ---------- Visitor (only stored when consent = accepted) ---------- */
 const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoose.Schema({
   visitor_id:  { type: String, required: true, unique: true, index: true },
-  // consent: 'accepted' (full tracking) | 'declined' (essentials only) | 'unknown'
-  consent:     { type: String, enum: ['accepted', 'declined', 'unknown'], default: 'unknown', index: true },
   ip:          { type: String, default: '' },
   country:     { type: String, default: '' },
   countryName: { type: String, default: '' },
@@ -31,6 +30,16 @@ const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoos
   vh:          { type: Number, default: null },
   first_seen:  { type: Date, default: Date.now },
   last_seen:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
+}));
+
+/* ---------- Security log (only stored when consent = declined/unknown) ---------- */
+const SecurityLog = mongoose.models.SecurityLog || mongoose.model('SecurityLog', new mongoose.Schema({
+  ip:        { type: String, required: true, index: true },
+  isBot:     { type: Boolean, default: false },
+  consent:   { type: String, enum: ['declined', 'unknown'], default: 'unknown', index: true },
+  startTime: { type: Date, default: Date.now },
+  endTime:   { type: Date, default: Date.now },
+  timestamp: { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
 const Session = mongoose.models.Session || mongoose.model('Session', new mongoose.Schema({
@@ -69,11 +78,6 @@ const Activity = mongoose.models.Activity || mongoose.model('Activity', new mong
 /* ============================================================
    HELPERS
    ============================================================ */
-const REQUIRED_ESSENTIALS = [
-  // Only what's strictly necessary for a functioning site + security
-  'visitor_id', 'session_id', 'ip', 'country', 'countryName', 'path', 'timestamp',
-];
-
 function parseUA(ua = '') {
   const l = ua.toLowerCase();
   const isBot = /bot|crawler|spider|crawling|slurp|facebookexternalhit|headlesschrome/i.test(l);
@@ -187,20 +191,32 @@ const strip = (doc) => {
   return { ...rest, id: _id.toString() };
 };
 
-/* Strip non-essential fields from a visitor doc (used when consent = declined) */
-async function stripNonEssential(visitorId) {
-  await Visitor.updateOne(
-    { visitor_id: visitorId },
-    {
-      $set: {
-        region: '', city: '', lat: null, lon: null, accuracy: null, geoSource: '',
-        device: '', browser: '', os: '',
-        sw: null, sh: null, vw: null, vh: null,
-      },
-    }
-  );
-  // Also remove click activity (non-essential)
-  await Activity.deleteMany({ visitor_id: visitorId });
+/* ============================================================
+   SECURITY LOG — for declined / unknown users
+   Stores ONLY: ip, isBot, consent, startTime, endTime, timestamp
+   Groups activity by IP within a 30-minute window.
+   ============================================================ */
+async function writeSecurityLog({ ip, isBot, consent }) {
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000);   // 30-min window
+
+  const existing = await SecurityLog
+    .findOne({ ip, consent, timestamp: { $gte: cutoff } })
+    .sort({ timestamp: -1 });
+
+  if (existing) {
+    existing.endTime  = new Date();
+    existing.timestamp = new Date();
+    await existing.save();
+  } else {
+    await SecurityLog.create({
+      ip,
+      isBot,
+      consent,
+      startTime: new Date(),
+      endTime:   new Date(),
+      timestamp: new Date(),
+    });
+  }
 }
 
 /* ============================================================
@@ -228,98 +244,89 @@ router.post('/track', async (req, res) => {
 
     if (isBot) return res.json({ ok: true, skipped: 'bot' });
 
-    // Determine effective consent: prefer incoming, else what we already have
+    // ---------------------------------------------------------
+    // CONSENT GATE
+    // ---------------------------------------------------------
     const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
-    const consent = incomingConsent
-      || existing?.consent
-      || 'unknown';
+    const consent = incomingConsent || existing?.consent || 'unknown';
     const hasFullConsent = consent === 'accepted';
-    const wasAccepted = existing?.consent === 'accepted';
 
-    // If user flipped from accepted → declined, strip previously saved non-essential data
-    if (consent === 'declined' && wasAccepted) {
-      await stripNonEssential(visitorId);
+    // If user previously accepted but is now declining → wipe their Visitor record
+    if (!hasFullConsent && existing) {
+      await Promise.all([
+        Visitor.deleteOne({ visitor_id: visitorId }),
+        Session.deleteMany({ visitor_id: visitorId }),
+        PageView.deleteMany({ visitor_id: visitorId }),
+        Activity.deleteMany({ visitor_id: visitorId }),
+      ]);
     }
 
+    // ---------------------------------------------------------
+    // DECLINED / UNKNOWN → only security log, nothing else
+    // ---------------------------------------------------------
+    if (!hasFullConsent) {
+      if (type === 'pageview') {
+        await writeSecurityLog({
+          ip,
+          isBot: false,
+          consent: consent === 'declined' ? 'declined' : 'unknown',
+        });
+      }
+      return res.json({ ok: true, consent, stored: 'security-log' });
+    }
+
+    // ---------------------------------------------------------
+    // ACCEPTED → full data capture
+    // ---------------------------------------------------------
     if (type === 'pageview') {
       let ipGeo = null;
       if (!existing || !existing.country) {
         ipGeo = await lookupGeo(ip, req.headers);
       }
 
-      const hasGps = hasFullConsent
-        && clientGeo
+      const hasGps = clientGeo
         && typeof clientGeo.lat === 'number'
         && typeof clientGeo.lon === 'number';
 
-      /* ---------- Essential fields (always saved) ---------- */
       const update = {
         $set: {
-          ip,
-          consent,
+          ip, device, browser, os,
+          sw: screen?.w   ?? null,
+          sh: screen?.h   ?? null,
+          vw: viewport?.w ?? null,
+          vh: viewport?.h ?? null,
           last_seen: new Date(),
         },
         $setOnInsert: { visitor_id: visitorId, first_seen: new Date() },
       };
 
-      // Country is saved for everyone (coarse geo — needed for security/abuse)
       if (ipGeo) {
         update.$set.country     = ipGeo.country;
         update.$set.countryName = ipGeo.countryName;
+        update.$set.region      = ipGeo.region;
+        update.$set.city        = ipGeo.city;
       }
 
-      /* ---------- Non-essential fields (only if consent accepted) ---------- */
-      if (hasFullConsent) {
-        update.$set.device  = device;
-        update.$set.browser = browser;
-        update.$set.os      = os;
-        update.$set.sw      = screen?.w   ?? null;
-        update.$set.sh      = screen?.h   ?? null;
-        update.$set.vw      = viewport?.w ?? null;
-        update.$set.vh      = viewport?.h ?? null;
-
-        if (ipGeo) {
-          update.$set.region = ipGeo.region;
-          update.$set.city   = ipGeo.city;
-        }
-
-        if (hasGps) {
-          update.$set.lat       = clientGeo.lat;
-          update.$set.lon       = clientGeo.lon;
-          update.$set.accuracy  = typeof clientGeo.accuracy === 'number' ? clientGeo.accuracy : null;
-          update.$set.geoSource = 'gps';
-        } else if (ipGeo && ipGeo.lat !== null && ipGeo.lon !== null) {
-          update.$set.lat       = ipGeo.lat;
-          update.$set.lon       = ipGeo.lon;
-          update.$set.accuracy  = null;
-          update.$set.geoSource = 'ip';
-        }
-      } else {
-        // Ensure declined visitors never carry non-essential data
-        update.$set.region = '';
-        update.$set.city   = '';
-        update.$set.lat    = null;
-        update.$set.lon    = null;
-        update.$set.accuracy = null;
-        update.$set.geoSource = '';
-        update.$set.device  = '';
-        update.$set.browser = '';
-        update.$set.os      = '';
-        update.$set.sw      = null;
-        update.$set.sh      = null;
-        update.$set.vw      = null;
-        update.$set.vh      = null;
+      if (hasGps) {
+        update.$set.lat       = clientGeo.lat;
+        update.$set.lon       = clientGeo.lon;
+        update.$set.accuracy  = typeof clientGeo.accuracy === 'number' ? clientGeo.accuracy : null;
+        update.$set.geoSource = 'gps';
+      } else if (ipGeo && ipGeo.lat !== null && ipGeo.lon !== null) {
+        update.$set.lat       = ipGeo.lat;
+        update.$set.lon       = ipGeo.lon;
+        update.$set.accuracy  = null;
+        update.$set.geoSource = 'ip';
       }
 
       await Visitor.findOneAndUpdate({ visitor_id: visitorId }, update, { upsert: true });
 
-      /* ---------- Session ---------- */
       const sess = await Session.findOne({ session_id: sessionId }).lean();
       if (!sess) {
         await Session.create({
           session_id: sessionId, visitor_id: visitorId,
           landing: path || '/', exit: path || '/',
-          ref_host: hasFullConsent ? hostOf(referrer) : '',
+          ref_host: hostOf(referrer),
           page_views: 1, clicks: 0, duration_ms: 0,
           started_at: new Date(), ended_at: new Date(),
         });
@@ -329,32 +336,18 @@ router.post('/track', async (req, res) => {
         const duration = (sess.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
         await Session.updateOne(
           { session_id: sessionId },
-          {
-            $set: {
-              ended_at: new Date(),
-              duration_ms: duration,
-              exit: path || '/',
-              ...(hasFullConsent && !sess.ref_host ? { ref_host: hostOf(referrer) } : {}),
-            },
-            $inc: { page_views: 1 },
-          }
+          { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
         );
       }
 
-      /* ---------- PageView ---------- */
       await PageView.create({
         visitor_id: visitorId, session_id: sessionId,
         path: path || '/',
-        title: hasFullConsent ? (title || '').slice(0, 120) : '',
-        ref_host: hasFullConsent ? hostOf(referrer) : '',
+        title: (title || '').slice(0, 120),
+        ref_host: hostOf(referrer),
         timestamp: new Date(),
       });
     } else if (type === 'click') {
-      // Click activity is non-essential — skip entirely for declined users
-      if (!hasFullConsent) {
-        return res.json({ ok: true, skipped: 'no-consent' });
-      }
-
       const dest = (() => {
         try { return new URL(destination, 'http://x').pathname; } catch { return destination || ''; }
       })();
@@ -384,7 +377,7 @@ router.post('/track', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Unknown type' });
     }
 
-    return res.json({ ok: true, consent });
+    return res.json({ ok: true, consent, stored: 'full' });
   } catch (err) {
     console.error('[track] error:', err);
     return res.status(500).json({ ok: false });
@@ -392,23 +385,19 @@ router.post('/track', async (req, res) => {
 });
 
 /* ============================================================
-   GET /api/analytics?type=...&consent=...
+   GET /api/analytics?type=...
    ============================================================ */
 router.get('/analytics', async (req, res) => {
   try {
-    const type     = req.query.type;
-    const range    = req.query.range || '7d';
-    const consentQ = req.query.consent || 'all';   // 'all' | 'accepted' | 'declined' | 'unknown'
-    const start    = rangeStart(range);
-
-    /* Build the consent part of the query */
-    const consentMatch = consentQ === 'all' ? {} : { consent: consentQ };
+    const type  = req.query.type;
+    const range = req.query.range || '7d';
+    const start = rangeStart(range);
 
     if (type === 'summary') {
       const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
 
-      const [uv, ss, pv, cl, avgRow, activeRow, bounced, newVs, avgPerSession, accepted, declined] = await Promise.all([
-        Visitor.countDocuments({ last_seen: { $gte: start }, ...consentMatch }),
+      const [uv, ss, pv, cl, avgRow, activeRow, bounced, newVs, avgPerSession, accepted, declined, unknown, securityCount] = await Promise.all([
+        Visitor.countDocuments({ last_seen: { $gte: start } }),
         Session.countDocuments({ started_at: { $gte: start } }),
         PageView.countDocuments({ timestamp: { $gte: start } }),
         Activity.countDocuments({ type: 'click', timestamp: { $gte: start } }),
@@ -423,15 +412,17 @@ router.get('/analytics', async (req, res) => {
         ]),
         Session.countDocuments({ started_at: { $gte: start }, page_views: { $lte: 1 } }),
         Promise.all([
-          Visitor.countDocuments({ first_seen: { $gte: start }, last_seen: { $gte: start }, ...consentMatch }),
-          Visitor.countDocuments({ last_seen: { $gte: start }, ...consentMatch }),
+          Visitor.countDocuments({ first_seen: { $gte: start }, last_seen: { $gte: start } }),
+          Visitor.countDocuments({ last_seen: { $gte: start } }),
         ]),
         Session.aggregate([
           { $match: { started_at: { $gte: start } } },
           { $group: { _id: null, avgPages: { $avg: '$page_views' }, avgClicks: { $avg: '$clicks' } } },
         ]),
-        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'accepted' }),
-        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'declined' }),
+        Visitor.countDocuments({ last_seen: { $gte: start } }),
+        SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'declined' }),
+        SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'unknown' }),
+        SecurityLog.countDocuments({ timestamp: { $gte: start } }),
       ]);
 
       return res.json({
@@ -445,6 +436,8 @@ router.get('/analytics', async (req, res) => {
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
         consentAccepted: accepted,
         consentDeclined: declined,
+        consentUnknown:  unknown,
+        securityLogCount: securityCount,
       });
     }
 
@@ -464,7 +457,7 @@ router.get('/analytics', async (req, res) => {
 
     if (type === 'visitors') {
       const q = (req.query.q || '').trim();
-      const filter = { last_seen: { $gte: start }, ...consentMatch };
+      const filter = { last_seen: { $gte: start } };
       if (q) {
         const like = new RegExp(q, 'i');
         filter.$or = [
@@ -481,8 +474,8 @@ router.get('/analytics', async (req, res) => {
         { $group: {
             _id: '$visitor_id',
             sessions: { $sum: 1 },
-            pages: { $sum: '$page_views' },
-            clicks: { $sum: '$clicks' },
+            pages:    { $sum: '$page_views' },
+            clicks:   { $sum: '$clicks' },
         } },
       ]);
       const aggMap = agg.reduce((m, r) => (m[r._id] = r, m), {});
@@ -494,6 +487,7 @@ router.get('/analytics', async (req, res) => {
         sessions: aggMap[v.visitor_id]?.sessions || 0,
         pages:    aggMap[v.visitor_id]?.pages    || 0,
         clicks:   aggMap[v.visitor_id]?.clicks   || 0,
+        consent:  'accepted',
       })));
     }
 
@@ -515,6 +509,7 @@ router.get('/analytics', async (req, res) => {
           ...strip(visitor),
           screen_w: visitor.sw, screen_h: visitor.sh,
           viewport_w: visitor.vw, viewport_h: visitor.vh,
+          consent: 'accepted',
         },
         sessions: sessions.map((s) => ({ ...strip(s), landing_page: s.landing, exit_page: s.exit })),
         pageViews: pageViews.map(strip),
@@ -525,17 +520,17 @@ router.get('/analytics', async (req, res) => {
     if (type === 'breakdowns') {
       const [devices, browsers, os, topPages, referrers, entryPages, exitPages, hourly, countries, regions, cities] = await Promise.all([
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, ...consentMatch, device: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, device: { $ne: '' } } },
           { $group: { _id: '$device', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, ...consentMatch, browser: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, browser: { $ne: '' } } },
           { $group: { _id: '$browser', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, ...consentMatch, os: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, os: { $ne: '' } } },
           { $group: { _id: '$os', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
@@ -569,17 +564,17 @@ router.get('/analytics', async (req, res) => {
           { $sort: { hour: 1 } },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, ...consentMatch, country: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, country: { $ne: '' } } },
           { $group: { _id: { code: '$country', name: '$countryName' }, count: { $sum: 1 } } },
           { $sort: { count: -1 } }, { $limit: 15 },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, ...consentMatch, region: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, region: { $ne: '' } } },
           { $group: { _id: '$region', count: { $sum: 1 } } },
           { $sort: { count: -1 } }, { $limit: 15 },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, ...consentMatch, city: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, city: { $ne: '' } } },
           { $group: { _id: '$city', count: { $sum: 1 } } },
           { $sort: { count: -1 } }, { $limit: 15 },
         ]),
@@ -597,11 +592,27 @@ router.get('/analytics', async (req, res) => {
       });
     }
 
+    /* ---------- Security log (declined + unknown users) ---------- */
+    if (type === 'security-log') {
+      const logs = await SecurityLog
+        .find({ timestamp: { $gte: start } })
+        .sort({ timestamp: -1 })
+        .limit(500)
+        .lean();
+
+      return res.json(logs.map((l) => ({
+        ...strip(l),
+        durationMs: l.endTime && l.startTime
+          ? new Date(l.endTime).getTime() - new Date(l.startTime).getTime()
+          : 0,
+      })));
+    }
+
     if (type === 'consent-breakdown') {
       const [accepted, declined, unknown] = await Promise.all([
-        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'accepted' }),
-        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'declined' }),
-        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'unknown' }),
+        Visitor.countDocuments({ last_seen: { $gte: start } }),
+        SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'declined' }),
+        SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'unknown' }),
       ]);
       return res.json({ accepted, declined, unknown });
     }
@@ -614,7 +625,7 @@ router.get('/analytics', async (req, res) => {
 });
 
 /* ============================================================
-   DELETE — visitor + all related records
+   DELETE
    ============================================================ */
 router.delete('/analytics/visitor/:id', protect, async (req, res) => {
   try {
@@ -664,6 +675,32 @@ router.post('/analytics/visitors/delete', protect, async (req, res) => {
     });
   } catch (err) {
     console.error('[analytics bulk delete] error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ---------- Delete security log entry ---------- */
+router.delete('/analytics/security-log/:id', protect, async (req, res) => {
+  try {
+    const result = await SecurityLog.deleteOne({ _id: req.params.id });
+    return res.json({ ok: true, deleted: result.deletedCount });
+  } catch (err) {
+    console.error('[security-log delete] error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ---------- Bulk delete security log entries ---------- */
+router.post('/analytics/security-log/bulk-delete', protect, async (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ ok: false, error: 'No IDs provided' });
+    }
+    const result = await SecurityLog.deleteMany({ _id: { $in: ids } });
+    return res.json({ ok: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('[security-log bulk delete] error:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
