@@ -11,6 +11,8 @@ const TTL_90D = 90 * 24 * 60 * 60;
 
 const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoose.Schema({
   visitor_id:  { type: String, required: true, unique: true, index: true },
+  // consent: 'accepted' (full tracking) | 'declined' (essentials only) | 'unknown'
+  consent:     { type: String, enum: ['accepted', 'declined', 'unknown'], default: 'unknown', index: true },
   ip:          { type: String, default: '' },
   country:     { type: String, default: '' },
   countryName: { type: String, default: '' },
@@ -20,9 +22,9 @@ const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoos
   lon:         { type: Number, default: null },
   accuracy:    { type: Number, default: null },
   geoSource:   { type: String, default: '' },
-  device:      { type: String, default: 'desktop' },
-  browser:     { type: String, default: 'Other' },
-  os:          { type: String, default: 'Other' },
+  device:      { type: String, default: '' },
+  browser:     { type: String, default: '' },
+  os:          { type: String, default: '' },
   sw:          { type: Number, default: null },
   sh:          { type: Number, default: null },
   vw:          { type: Number, default: null },
@@ -65,8 +67,13 @@ const Activity = mongoose.models.Activity || mongoose.model('Activity', new mong
 }));
 
 /* ============================================================
-   UA PARSER
+   HELPERS
    ============================================================ */
+const REQUIRED_ESSENTIALS = [
+  // Only what's strictly necessary for a functioning site + security
+  'visitor_id', 'session_id', 'ip', 'country', 'countryName', 'path', 'timestamp',
+];
+
 function parseUA(ua = '') {
   const l = ua.toLowerCase();
   const isBot = /bot|crawler|spider|crawling|slurp|facebookexternalhit|headlesschrome/i.test(l);
@@ -97,44 +104,28 @@ function parseUA(ua = '') {
   return { device, browser, os, isBot };
 }
 
-/* ============================================================
-   GEO LOOKUP — Vercel headers first, then 2 fallback APIs
-   ============================================================ */
 const geoCache = new Map();
 const GEO_TTL = 24 * 60 * 60 * 1000;
 
 const isPrivateIp = (ip) =>
-  !ip ||
-  ip === '::1' ||
-  ip === '127.0.0.1' ||
-  ip.startsWith('192.168.') ||
-  ip.startsWith('10.') ||
-  ip.startsWith('172.16.') ||
-  ip.startsWith('172.17.') ||
-  ip.startsWith('172.18.') ||
-  ip.startsWith('172.19.') ||
-  ip.startsWith('172.2') ||
-  ip.startsWith('172.30.') ||
-  ip.startsWith('172.31.');
+  !ip || ip === '::1' || ip === '127.0.0.1' ||
+  ip.startsWith('192.168.') || ip.startsWith('10.') ||
+  ip.startsWith('172.16.') || ip.startsWith('172.17.') ||
+  ip.startsWith('172.18.') || ip.startsWith('172.19.') ||
+  ip.startsWith('172.2') || ip.startsWith('172.30.') || ip.startsWith('172.31.');
 
 async function lookupFromIpApiCo(ip) {
   try {
-    const res = await fetch(`https://ipapi.co/${ip}/json/`, {
-      headers: { 'User-Agent': 'towasic-analytics/1.0' },
-    });
+    const res = await fetch(`https://ipapi.co/${ip}/json/`, { headers: { 'User-Agent': 'towasic-analytics/1.0' } });
     const j = await res.json();
     if (j.error) return null;
     return {
-      country:     (j.country_code || '').toUpperCase(),
-      countryName: j.country_name || '',
-      region:      j.region || '',
-      city:        j.city || '',
-      lat:         typeof j.latitude === 'number' ? j.latitude : null,
-      lon:         typeof j.longitude === 'number' ? j.longitude : null,
+      country: (j.country_code || '').toUpperCase(), countryName: j.country_name || '',
+      region: j.region || '', city: j.city || '',
+      lat: typeof j.latitude === 'number' ? j.latitude : null,
+      lon: typeof j.longitude === 'number' ? j.longitude : null,
     };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function lookupFromIpWhoIs(ip) {
@@ -143,51 +134,35 @@ async function lookupFromIpWhoIs(ip) {
     const j = await res.json();
     if (!j.success) return null;
     return {
-      country:     (j.country_code || '').toUpperCase(),
-      countryName: j.country || '',
-      region:      j.region || '',
-      city:        j.city || '',
-      lat:         typeof j.latitude === 'number' ? j.latitude : null,
-      lon:         typeof j.longitude === 'number' ? j.longitude : null,
+      country: (j.country_code || '').toUpperCase(), countryName: j.country || '',
+      region: j.region || '', city: j.city || '',
+      lat: typeof j.latitude === 'number' ? j.latitude : null,
+      lon: typeof j.longitude === 'number' ? j.longitude : null,
     };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function lookupGeo(ip, headers = {}) {
-  // 1) Vercel headers
   const vc = headers['x-vercel-ip-country'];
   if (vc) {
     const city = (headers['x-vercel-ip-city'] || '').replace(/%20/g, ' ');
     return {
-      country:     vc.toUpperCase(),
+      country: vc.toUpperCase(),
       countryName: headers['x-vercel-ip-country-name'] || '',
-      region:      headers['x-vercel-ip-country-region'] || '',
+      region: headers['x-vercel-ip-country-region'] || '',
       city,
-      lat:         parseFloat(headers['x-vercel-ip-latitude']) || null,
-      lon:         parseFloat(headers['x-vercel-ip-longitude']) || null,
+      lat: parseFloat(headers['x-vercel-ip-latitude']) || null,
+      lon: parseFloat(headers['x-vercel-ip-longitude']) || null,
     };
   }
+  if (isPrivateIp(ip)) return { country: '', countryName: '', region: '', city: '', lat: null, lon: null };
 
-  // 2) Skip private IPs
-  if (isPrivateIp(ip)) {
-    return { country: '', countryName: '', region: '', city: '', lat: null, lon: null };
-  }
-
-  // 3) Cache
   const cached = geoCache.get(ip);
   if (cached && Date.now() - cached.ts < GEO_TTL) return cached.data;
 
-  // 4) Fallback providers
   let data = await lookupFromIpApiCo(ip);
-  if (!data || !data.country) {
-    data = await lookupFromIpWhoIs(ip);
-  }
-
-  if (!data) {
-    data = { country: '', countryName: '', region: '', city: '', lat: null, lon: null };
-  }
+  if (!data || !data.country) data = await lookupFromIpWhoIs(ip);
+  if (!data) data = { country: '', countryName: '', region: '', city: '', lat: null, lon: null };
 
   geoCache.set(ip, { data, ts: Date.now() });
   return data;
@@ -212,6 +187,22 @@ const strip = (doc) => {
   return { ...rest, id: _id.toString() };
 };
 
+/* Strip non-essential fields from a visitor doc (used when consent = declined) */
+async function stripNonEssential(visitorId) {
+  await Visitor.updateOne(
+    { visitor_id: visitorId },
+    {
+      $set: {
+        region: '', city: '', lat: null, lon: null, accuracy: null, geoSource: '',
+        device: '', browser: '', os: '',
+        sw: null, sh: null, vw: null, vh: null,
+      },
+    }
+  );
+  // Also remove click activity (non-essential)
+  await Activity.deleteMany({ visitor_id: visitorId });
+}
+
 /* ============================================================
    POST /api/track
    ============================================================ */
@@ -221,6 +212,7 @@ router.post('/track', async (req, res) => {
     const {
       type, visitorId, sessionId, url, path, title, referrer,
       screen, viewport, element, text, destination, clientGeo,
+      consent: incomingConsent,
     } = d;
 
     if (!visitorId || !sessionId || !type) {
@@ -236,58 +228,98 @@ router.post('/track', async (req, res) => {
 
     if (isBot) return res.json({ ok: true, skipped: 'bot' });
 
-    if (type === 'pageview') {
-      const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
+    // Determine effective consent: prefer incoming, else what we already have
+    const existing = await Visitor.findOne({ visitor_id: visitorId }).lean();
+    const consent = incomingConsent
+      || existing?.consent
+      || 'unknown';
+    const hasFullConsent = consent === 'accepted';
+    const wasAccepted = existing?.consent === 'accepted';
 
+    // If user flipped from accepted → declined, strip previously saved non-essential data
+    if (consent === 'declined' && wasAccepted) {
+      await stripNonEssential(visitorId);
+    }
+
+    if (type === 'pageview') {
       let ipGeo = null;
       if (!existing || !existing.country) {
         ipGeo = await lookupGeo(ip, req.headers);
-        console.log('[track] IP geo for', ip, '→', ipGeo);
       }
 
-      const hasGps = clientGeo
+      const hasGps = hasFullConsent
+        && clientGeo
         && typeof clientGeo.lat === 'number'
         && typeof clientGeo.lon === 'number';
 
+      /* ---------- Essential fields (always saved) ---------- */
       const update = {
         $set: {
-          ip, device, browser, os,
-          sw: screen?.w   ?? null,
-          sh: screen?.h   ?? null,
-          vw: viewport?.w ?? null,
-          vh: viewport?.h ?? null,
+          ip,
+          consent,
           last_seen: new Date(),
         },
         $setOnInsert: { visitor_id: visitorId, first_seen: new Date() },
       };
 
+      // Country is saved for everyone (coarse geo — needed for security/abuse)
       if (ipGeo) {
         update.$set.country     = ipGeo.country;
         update.$set.countryName = ipGeo.countryName;
-        update.$set.region      = ipGeo.region;
-        update.$set.city        = ipGeo.city;
       }
 
-      if (hasGps) {
-        update.$set.lat       = clientGeo.lat;
-        update.$set.lon       = clientGeo.lon;
-        update.$set.accuracy  = typeof clientGeo.accuracy === 'number' ? clientGeo.accuracy : null;
-        update.$set.geoSource = 'gps';
-      } else if (ipGeo && ipGeo.lat !== null && ipGeo.lon !== null) {
-        update.$set.lat       = ipGeo.lat;
-        update.$set.lon       = ipGeo.lon;
-        update.$set.accuracy  = null;
-        update.$set.geoSource = 'ip';
+      /* ---------- Non-essential fields (only if consent accepted) ---------- */
+      if (hasFullConsent) {
+        update.$set.device  = device;
+        update.$set.browser = browser;
+        update.$set.os      = os;
+        update.$set.sw      = screen?.w   ?? null;
+        update.$set.sh      = screen?.h   ?? null;
+        update.$set.vw      = viewport?.w ?? null;
+        update.$set.vh      = viewport?.h ?? null;
+
+        if (ipGeo) {
+          update.$set.region = ipGeo.region;
+          update.$set.city   = ipGeo.city;
+        }
+
+        if (hasGps) {
+          update.$set.lat       = clientGeo.lat;
+          update.$set.lon       = clientGeo.lon;
+          update.$set.accuracy  = typeof clientGeo.accuracy === 'number' ? clientGeo.accuracy : null;
+          update.$set.geoSource = 'gps';
+        } else if (ipGeo && ipGeo.lat !== null && ipGeo.lon !== null) {
+          update.$set.lat       = ipGeo.lat;
+          update.$set.lon       = ipGeo.lon;
+          update.$set.accuracy  = null;
+          update.$set.geoSource = 'ip';
+        }
+      } else {
+        // Ensure declined visitors never carry non-essential data
+        update.$set.region = '';
+        update.$set.city   = '';
+        update.$set.lat    = null;
+        update.$set.lon    = null;
+        update.$set.accuracy = null;
+        update.$set.geoSource = '';
+        update.$set.device  = '';
+        update.$set.browser = '';
+        update.$set.os      = '';
+        update.$set.sw      = null;
+        update.$set.sh      = null;
+        update.$set.vw      = null;
+        update.$set.vh      = null;
       }
 
       await Visitor.findOneAndUpdate({ visitor_id: visitorId }, update, { upsert: true });
 
+      /* ---------- Session ---------- */
       const sess = await Session.findOne({ session_id: sessionId }).lean();
       if (!sess) {
         await Session.create({
           session_id: sessionId, visitor_id: visitorId,
           landing: path || '/', exit: path || '/',
-          ref_host: hostOf(referrer),
+          ref_host: hasFullConsent ? hostOf(referrer) : '',
           page_views: 1, clicks: 0, duration_ms: 0,
           started_at: new Date(), ended_at: new Date(),
         });
@@ -297,18 +329,32 @@ router.post('/track', async (req, res) => {
         const duration = (sess.duration_ms || 0) + (idleMs > 0 ? idleMs : 0);
         await Session.updateOne(
           { session_id: sessionId },
-          { $set: { ended_at: new Date(), duration_ms: duration, exit: path || '/' }, $inc: { page_views: 1 } }
+          {
+            $set: {
+              ended_at: new Date(),
+              duration_ms: duration,
+              exit: path || '/',
+              ...(hasFullConsent && !sess.ref_host ? { ref_host: hostOf(referrer) } : {}),
+            },
+            $inc: { page_views: 1 },
+          }
         );
       }
 
+      /* ---------- PageView ---------- */
       await PageView.create({
         visitor_id: visitorId, session_id: sessionId,
         path: path || '/',
-        title: (title || '').slice(0, 120),
-        ref_host: hostOf(referrer),
+        title: hasFullConsent ? (title || '').slice(0, 120) : '',
+        ref_host: hasFullConsent ? hostOf(referrer) : '',
         timestamp: new Date(),
       });
     } else if (type === 'click') {
+      // Click activity is non-essential — skip entirely for declined users
+      if (!hasFullConsent) {
+        return res.json({ ok: true, skipped: 'no-consent' });
+      }
+
       const dest = (() => {
         try { return new URL(destination, 'http://x').pathname; } catch { return destination || ''; }
       })();
@@ -324,18 +370,21 @@ router.post('/track', async (req, res) => {
 
       await Session.updateOne(
         { session_id: sessionId },
-        { $inc: { clicks: 1 }, $set: { ended_at: new Date() },
+        {
+          $inc: { clicks: 1 },
+          $set: { ended_at: new Date() },
           $setOnInsert: {
             visitor_id: visitorId, landing: path || '/', exit: path || '/',
             page_views: 0, duration_ms: 0, started_at: new Date(),
-          } },
+          },
+        },
         { upsert: true }
       );
     } else {
       return res.status(400).json({ ok: false, error: 'Unknown type' });
     }
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, consent });
   } catch (err) {
     console.error('[track] error:', err);
     return res.status(500).json({ ok: false });
@@ -343,45 +392,23 @@ router.post('/track', async (req, res) => {
 });
 
 /* ============================================================
-   GET /api/analytics?type=...
+   GET /api/analytics?type=...&consent=...
    ============================================================ */
 router.get('/analytics', async (req, res) => {
   try {
-    const type  = req.query.type;
-    const range = req.query.range || '7d';
-    const start = rangeStart(range);
+    const type     = req.query.type;
+    const range    = req.query.range || '7d';
+    const consentQ = req.query.consent || 'all';   // 'all' | 'accepted' | 'declined' | 'unknown'
+    const start    = rangeStart(range);
 
-    /* ---------------- DEBUG: server-side geo test ---------------- */
-    if (type === 'geotest') {
-      const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '';
-      const headers = {
-        'x-vercel-ip-country':         req.headers['x-vercel-ip-country'],
-        'x-vercel-ip-country-name':    req.headers['x-vercel-ip-country-name'],
-        'x-vercel-ip-country-region':  req.headers['x-vercel-ip-country-region'],
-        'x-vercel-ip-city':            req.headers['x-vercel-ip-city'],
-        'x-vercel-ip-latitude':        req.headers['x-vercel-ip-latitude'],
-        'x-vercel-ip-longitude':       req.headers['x-vercel-ip-longitude'],
-      };
-      const geo = await lookupGeo(ip, headers);
-      return res.json({
-        yourIp: ip,
-        vercelHeaders: {
-          country: headers['x-vercel-ip-country'] || null,
-          region:  headers['x-vercel-ip-country-region'] || null,
-          city:    headers['x-vercel-ip-city'] || null,
-          lat:     headers['x-vercel-ip-latitude'] || null,
-          lon:     headers['x-vercel-ip-longitude'] || null,
-        },
-        resolvedGeo: geo,
-        note: 'If vercelHeaders are all null, your deployment is missing Vercel geo. Fallback APIs were used instead.',
-      });
-    }
+    /* Build the consent part of the query */
+    const consentMatch = consentQ === 'all' ? {} : { consent: consentQ };
 
     if (type === 'summary') {
       const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
 
-      const [uv, ss, pv, cl, avgRow, activeRow, bounced, newVs, avgPerSession] = await Promise.all([
-        Visitor.countDocuments({ last_seen: { $gte: start } }),
+      const [uv, ss, pv, cl, avgRow, activeRow, bounced, newVs, avgPerSession, accepted, declined] = await Promise.all([
+        Visitor.countDocuments({ last_seen: { $gte: start }, ...consentMatch }),
         Session.countDocuments({ started_at: { $gte: start } }),
         PageView.countDocuments({ timestamp: { $gte: start } }),
         Activity.countDocuments({ type: 'click', timestamp: { $gte: start } }),
@@ -396,13 +423,15 @@ router.get('/analytics', async (req, res) => {
         ]),
         Session.countDocuments({ started_at: { $gte: start }, page_views: { $lte: 1 } }),
         Promise.all([
-          Visitor.countDocuments({ first_seen: { $gte: start }, last_seen: { $gte: start } }),
-          Visitor.countDocuments({ last_seen: { $gte: start } }),
+          Visitor.countDocuments({ first_seen: { $gte: start }, last_seen: { $gte: start }, ...consentMatch }),
+          Visitor.countDocuments({ last_seen: { $gte: start }, ...consentMatch }),
         ]),
         Session.aggregate([
           { $match: { started_at: { $gte: start } } },
           { $group: { _id: null, avgPages: { $avg: '$page_views' }, avgClicks: { $avg: '$clicks' } } },
         ]),
+        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'accepted' }),
+        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'declined' }),
       ]);
 
       return res.json({
@@ -414,6 +443,8 @@ router.get('/analytics', async (req, res) => {
         returningVisitors: Math.max(0, newVs[1] - newVs[0]),
         avgPagesPerSession: +(avgPerSession[0]?.avgPages || 0).toFixed(2),
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
+        consentAccepted: accepted,
+        consentDeclined: declined,
       });
     }
 
@@ -433,7 +464,7 @@ router.get('/analytics', async (req, res) => {
 
     if (type === 'visitors') {
       const q = (req.query.q || '').trim();
-      const filter = { last_seen: { $gte: start } };
+      const filter = { last_seen: { $gte: start }, ...consentMatch };
       if (q) {
         const like = new RegExp(q, 'i');
         filter.$or = [
@@ -494,17 +525,17 @@ router.get('/analytics', async (req, res) => {
     if (type === 'breakdowns') {
       const [devices, browsers, os, topPages, referrers, entryPages, exitPages, hourly, countries, regions, cities] = await Promise.all([
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start } } },
+          { $match: { last_seen: { $gte: start }, ...consentMatch, device: { $ne: '' } } },
           { $group: { _id: '$device', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start } } },
+          { $match: { last_seen: { $gte: start }, ...consentMatch, browser: { $ne: '' } } },
           { $group: { _id: '$browser', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start } } },
+          { $match: { last_seen: { $gte: start }, ...consentMatch, os: { $ne: '' } } },
           { $group: { _id: '$os', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
@@ -538,17 +569,17 @@ router.get('/analytics', async (req, res) => {
           { $sort: { hour: 1 } },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, country: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, ...consentMatch, country: { $ne: '' } } },
           { $group: { _id: { code: '$country', name: '$countryName' }, count: { $sum: 1 } } },
           { $sort: { count: -1 } }, { $limit: 15 },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, region: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, ...consentMatch, region: { $ne: '' } } },
           { $group: { _id: '$region', count: { $sum: 1 } } },
           { $sort: { count: -1 } }, { $limit: 15 },
         ]),
         Visitor.aggregate([
-          { $match: { last_seen: { $gte: start }, city: { $ne: '' } } },
+          { $match: { last_seen: { $gte: start }, ...consentMatch, city: { $ne: '' } } },
           { $group: { _id: '$city', count: { $sum: 1 } } },
           { $sort: { count: -1 } }, { $limit: 15 },
         ]),
@@ -566,6 +597,15 @@ router.get('/analytics', async (req, res) => {
       });
     }
 
+    if (type === 'consent-breakdown') {
+      const [accepted, declined, unknown] = await Promise.all([
+        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'accepted' }),
+        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'declined' }),
+        Visitor.countDocuments({ last_seen: { $gte: start }, consent: 'unknown' }),
+      ]);
+      return res.json({ accepted, declined, unknown });
+    }
+
     return res.status(400).json({ error: 'Unknown type' });
   } catch (err) {
     console.error('[analytics] error:', err);
@@ -576,8 +616,6 @@ router.get('/analytics', async (req, res) => {
 /* ============================================================
    DELETE — visitor + all related records
    ============================================================ */
-
-/* DELETE /api/analytics/visitor/:id — single delete */
 router.delete('/analytics/visitor/:id', protect, async (req, res) => {
   try {
     const { id } = req.params;
@@ -593,10 +631,8 @@ router.delete('/analytics/visitor/:id', protect, async (req, res) => {
     return res.json({
       ok: true,
       deleted: {
-        visitors: v.deletedCount,
-        sessions: s.deletedCount,
-        pageViews: p.deletedCount,
-        activities: a.deletedCount,
+        visitors: v.deletedCount, sessions: s.deletedCount,
+        pageViews: p.deletedCount, activities: a.deletedCount,
       },
     });
   } catch (err) {
@@ -605,8 +641,6 @@ router.delete('/analytics/visitor/:id', protect, async (req, res) => {
   }
 });
 
-/* POST /api/analytics/visitors/delete — bulk delete
-   Body: { ids: ['vid1', 'vid2', ...] } */
 router.post('/analytics/visitors/delete', protect, async (req, res) => {
   try {
     const { ids } = req.body || {};
@@ -622,13 +656,10 @@ router.post('/analytics/visitors/delete', protect, async (req, res) => {
     ]);
 
     return res.json({
-      ok: true,
-      deletedCount: ids.length,
+      ok: true, deletedCount: ids.length,
       breakdown: {
-        visitors: v.deletedCount,
-        sessions: s.deletedCount,
-        pageViews: p.deletedCount,
-        activities: a.deletedCount,
+        visitors: v.deletedCount, sessions: s.deletedCount,
+        pageViews: p.deletedCount, activities: a.deletedCount,
       },
     });
   } catch (err) {
