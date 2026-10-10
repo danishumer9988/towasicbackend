@@ -32,11 +32,11 @@ const Visitor = mongoose.models.Visitor || mongoose.model('Visitor', new mongoos
   last_seen:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-/* ---------- Security log (only stored when consent = declined/unknown) ---------- */
+/* ---------- Security log (only written when consent = declined) ---------- */
 const SecurityLog = mongoose.models.SecurityLog || mongoose.model('SecurityLog', new mongoose.Schema({
   ip:        { type: String, required: true, index: true },
   isBot:     { type: Boolean, default: false },
-  consent:   { type: String, enum: ['declined', 'unknown'], default: 'unknown', index: true },
+  consent:   { type: String, enum: ['declined'], default: 'declined', index: true },
   startTime: { type: Date, default: Date.now },
   endTime:   { type: Date, default: Date.now },
   timestamp: { type: Date, default: Date.now, index: true, expires: TTL_90D },
@@ -192,26 +192,26 @@ const strip = (doc) => {
 };
 
 /* ============================================================
-   SECURITY LOG — for declined / unknown users
+   SECURITY LOG — for declined users only
    Stores ONLY: ip, isBot, consent, startTime, endTime, timestamp
    Groups activity by IP within a 30-minute window.
    ============================================================ */
-async function writeSecurityLog({ ip, isBot, consent }) {
+async function writeSecurityLog({ ip, isBot }) {
   const cutoff = new Date(Date.now() - 30 * 60 * 1000);   // 30-min window
 
   const existing = await SecurityLog
-    .findOne({ ip, consent, timestamp: { $gte: cutoff } })
+    .findOne({ ip, consent: 'declined', timestamp: { $gte: cutoff } })
     .sort({ timestamp: -1 });
 
   if (existing) {
-    existing.endTime  = new Date();
+    existing.endTime   = new Date();
     existing.timestamp = new Date();
     await existing.save();
   } else {
     await SecurityLog.create({
       ip,
       isBot,
-      consent,
+      consent:   'declined',
       startTime: new Date(),
       endTime:   new Date(),
       timestamp: new Date(),
@@ -262,18 +262,18 @@ router.post('/track', async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // DECLINED → only security log, nothing else
-    // UNKNOWN → nothing at all (user hasn't chosen yet)
+    // DECLINED → only security log
+    // UNKNOWN  → nothing at all (user hasn't chosen yet)
     // ---------------------------------------------------------
     if (!hasFullConsent) {
       if (type === 'pageview' && consent === 'declined') {
-        await writeSecurityLog({
-          ip,
-          isBot: false,
-          consent: 'declined',
-        });
+        await writeSecurityLog({ ip, isBot: false });
       }
-      return res.json({ ok: true, consent, stored: consent === 'declined' ? 'security-log' : 'skipped' });
+      return res.json({
+        ok: true,
+        consent,
+        stored: consent === 'declined' ? 'security-log' : 'skipped',
+      });
     }
 
     // ---------------------------------------------------------
@@ -397,7 +397,7 @@ router.get('/analytics', async (req, res) => {
     if (type === 'summary') {
       const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
 
-      const [uv, ss, pv, cl, avgRow, activeRow, bounced, newVs, avgPerSession, accepted, declined, unknown, securityCount] = await Promise.all([
+      const [uv, ss, pv, cl, avgRow, activeRow, bounced, newVs, avgPerSession, accepted, declined] = await Promise.all([
         Visitor.countDocuments({ last_seen: { $gte: start } }),
         Session.countDocuments({ started_at: { $gte: start } }),
         PageView.countDocuments({ timestamp: { $gte: start } }),
@@ -422,8 +422,6 @@ router.get('/analytics', async (req, res) => {
         ]),
         Visitor.countDocuments({ last_seen: { $gte: start } }),
         SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'declined' }),
-        SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'unknown' }),
-        SecurityLog.countDocuments({ timestamp: { $gte: start } }),
       ]);
 
       return res.json({
@@ -437,8 +435,6 @@ router.get('/analytics', async (req, res) => {
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
         consentAccepted: accepted,
         consentDeclined: declined,
-        consentUnknown:  unknown,
-        securityLogCount: securityCount,
       });
     }
 
@@ -593,7 +589,7 @@ router.get('/analytics', async (req, res) => {
       });
     }
 
-    /* ---------- Security log (declined + unknown users) ---------- */
+    /* ---------- Security log (declined users only) ---------- */
     if (type === 'security-log') {
       const logs = await SecurityLog
         .find({ timestamp: { $gte: start } })
@@ -610,12 +606,11 @@ router.get('/analytics', async (req, res) => {
     }
 
     if (type === 'consent-breakdown') {
-      const [accepted, declined, unknown] = await Promise.all([
+      const [accepted, declined] = await Promise.all([
         Visitor.countDocuments({ last_seen: { $gte: start } }),
         SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'declined' }),
-        SecurityLog.countDocuments({ timestamp: { $gte: start }, consent: 'unknown' }),
       ]);
-      return res.json({ accepted, declined, unknown });
+      return res.json({ accepted, declined });
     }
 
     return res.status(400).json({ error: 'Unknown type' });
