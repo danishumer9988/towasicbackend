@@ -1,40 +1,30 @@
 const AdmZip = require('adm-zip');
 const nodemailer = require('nodemailer');
-
-// Import your models
-const User = require('../models/User');
-const Blog = require('../models/Blog');
-const Category = require('../models/Category');
-const Contact = require('../models/Contact');
-const Estimate = require('../models/Estimate');
-const Industry = require('../models/Industry');
-const Project = require('../models/Project');
-const Subscription = require('../models/Subscription');
-const LegalPage = require('../models/LegalPage');
-// If you have other models, import them here too
+const mongoose = require('mongoose');
 
 const runBackup = async () => {
   console.log('[Backup] Starting weekly email backup...');
 
   try {
-    // 1. Fetch Data
-    const data = {
-      users: await User.find({}).lean(),
-      blogs: await Blog.find({}).lean(),
-      categories: await Category.find({}).lean(),
-      contacts: await Contact.find({}).lean(),
-      estimates: await Estimate.find({}).lean(),
-      industries: await Industry.find({}).lean(),
-      projects: await Project.find({}).lean(),
-      subscriptions: await Subscription.find({}).lean(),
-      legalPages: await LegalPage.find({}).lean(),
-    };
+    // 1. Fetch ALL collections dynamically directly from MongoDB
+    const db = mongoose.connection.db;
+    const collections = await db.listCollections().toArray();
+    const data = {};
+
+    for (const col of collections) {
+      // Skip system collections if any exist
+      if (col.name.startsWith('system.')) continue;
+
+      console.log(`[Backup] Fetching collection: ${col.name}`);
+      data[col.name] = await db.collection(col.name).find({}).toArray();
+    }
 
     // 2. Create ZIP
     const zip = new AdmZip();
     const dateStr = new Date().toISOString().split('T')[0];
     const zipFilename = `towasic-backup-${dateStr}.zip`;
 
+    // Add each collection as a JSON file inside the ZIP
     Object.keys(data).forEach((key) => {
       zip.addFile(`${key}.json`, Buffer.from(JSON.stringify(data[key], null, 2)));
     });
