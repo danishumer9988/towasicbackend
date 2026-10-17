@@ -7,11 +7,13 @@ const runBackup = async () => {
   console.log('[Backup] Starting weekly Excel ZIP backup...');
 
   try {
-    if (mongoose.connection.readyState !== 1) {
-      throw new Error('MongoDB is not connected. Cannot run backup.');
+    // Access the active database connection handled by api/index.js middleware
+    const db = mongoose.connection.db;
+
+    if (!db) {
+      throw new Error('Database connection object is not ready. Please try again in a few seconds.');
     }
 
-    const db = mongoose.connection.db;
     const collections = await db.listCollections().toArray();
 
     // Create a new ZIP archive
