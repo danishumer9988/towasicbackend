@@ -6,25 +6,27 @@ const runBackup = async () => {
   console.log('[Backup] Starting weekly email backup...');
 
   try {
-    // 1. Fetch ALL collections dynamically directly from MongoDB
+    // 1. Wait for DB connection to be fully ready
+    if (mongoose.connection.readyState !== 1) {
+      throw new Error('MongoDB is not connected. Cannot run backup.');
+    }
+
+    // 2. Fetch ALL collections dynamically directly from MongoDB
     const db = mongoose.connection.db;
     const collections = await db.listCollections().toArray();
     const data = {};
 
     for (const col of collections) {
-      // Skip system collections if any exist
       if (col.name.startsWith('system.')) continue;
-
       console.log(`[Backup] Fetching collection: ${col.name}`);
       data[col.name] = await db.collection(col.name).find({}).toArray();
     }
 
-    // 2. Create ZIP
+    // 3. Create ZIP
     const zip = new AdmZip();
     const dateStr = new Date().toISOString().split('T')[0];
     const zipFilename = `towasic-backup-${dateStr}.zip`;
 
-    // Add each collection as a JSON file inside the ZIP
     Object.keys(data).forEach((key) => {
       zip.addFile(`${key}.json`, Buffer.from(JSON.stringify(data[key], null, 2)));
     });
@@ -32,7 +34,7 @@ const runBackup = async () => {
     const zipBuffer = zip.toBuffer();
     console.log(`[Backup] ZIP created in memory (${(zipBuffer.length / 1024).toFixed(2)} KB)`);
 
-    // 3. Send Email
+    // 4. Send Email
     const transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: {
