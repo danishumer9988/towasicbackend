@@ -5,12 +5,12 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 
 const TTL_90D = 90 * 24 * 60 * 60;
+const TTL_365D = 365 * 24 * 60 * 60; // 12 months for consent records
 
 /* ---------- Accepted visitors (full data) ---------- */
 const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   visitor_id:  { type: String, required: true, unique: true, index: true },
   consent:     { type: String, enum: ['accepted'], default: 'accepted', index: true },
-
   ip:          { type: String, default: '' },
   country:     { type: String, default: '' },
   countryName: { type: String, default: '' },
@@ -28,20 +28,17 @@ const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   vw:          { type: Number, default: null },
   vh:          { type: Number, default: null },
   last_page:   { type: String, default: '' },
-
   first_seen:  { type: Date, default: Date.now },
   last_seen:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-/* ---------- Declined / Unknown visitors (5 fields only) ----------
-   One row per visitor_id. Stored in a NEW collection so old rows
-   (which have no visitor_id) can never clash with the unique index. */
+/* ---------- Declined / Unknown visitors (IP kept for 90d, Record kept for 12mo) ---------- */
 const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
   visitor_id: { type: String, required: true, unique: true, index: true },
   ip:         { type: String, required: true, index: true },
   consent:    { type: String, enum: ['declined', 'unknown'], required: true, index: true },
   startTime:  { type: Date, required: true },
-  endTime:    { type: Date, required: true, index: true, expires: TTL_90D },
+  endTime:    { type: Date, required: true, index: true, expires: TTL_365D }, // Updated to 12 months
 }, { collection: 'visitor_consent_logs' }));
 
 const Session = mongoose.model('Session', new mongoose.Schema({
@@ -54,7 +51,7 @@ const Session = mongoose.model('Session', new mongoose.Schema({
   clicks:      { type: Number, default: 0 },
   duration_ms: { type: Number, default: 0 },
   started_at:  { type: Date, default: Date.now, index: true },
-  ended_at:    { type: Date, default: Date.now },
+  ended_at:    { type: Date, default: Date.now, expires: TTL_90D }, // Added TTL
 }));
 
 const PageView = mongoose.model('PageView', new mongoose.Schema({
@@ -76,6 +73,8 @@ const Activity = mongoose.model('Activity', new mongoose.Schema({
   destination: { type: String, default: '' },
   timestamp:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
+
+// ... (REST OF YOUR analytics.js FILE REMAINS EXACTLY THE SAME)
 
 /* ============================================================
    HELPERS

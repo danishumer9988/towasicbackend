@@ -10,6 +10,10 @@
     {
       "path": "/api/cron/run-backup",
       "schedule": "0 0 * * 0"
+    },
+    {
+      "path": "/api/cron/cleanup-ips",
+      "schedule": "0 0 * * *"
     }
   ]
 }

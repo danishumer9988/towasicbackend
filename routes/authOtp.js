@@ -6,6 +6,7 @@ const router = express.Router();
 const User = require('../models/User');
 const OtpToken = require('../models/OtpToken');
 const { protect } = require('../middleware/auth');
+const { logEvent } = require('../utils/logger'); // <-- Added Logger
 const {
   sendLoginOtp,
   sendInviteOtp,
@@ -138,6 +139,9 @@ router.post('/login-verify', async (req, res) => {
     await user.save();
 
     sendLoginNotification(user.email, meta).catch(() => {});
+
+    // Log the successful login to the System Logs
+    await logEvent('ADMIN_LOGIN', user.email, 'Logged in successfully.', meta.ip);
 
     return res.json({
       user: publicUser(user),
