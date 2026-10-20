@@ -12,6 +12,11 @@ const BlogSchema = new mongoose.Schema({
   tags: [{
     type: String
   }],
+  // ADDED CATEGORY FIELD
+  category: {
+    type: String,
+    default: ''
+  },
   slug: {
     type: String,
     required: true,

@@ -34,10 +34,14 @@ const makeSlug = async (title, id = null) => {
 };
 
 // @route   GET api/blogs
-// @desc    Get all blog posts
+// @desc    Get all blog posts (optional ?category=slug filter)
 router.get('/', async (req, res) => {
   try {
-    const blogs = await Blog.find({}).sort({ createdAt: -1 });
+    const filter = {};
+    if (req.query.category) {
+      filter.category = req.query.category;
+    }
+    const blogs = await Blog.find(filter).sort({ createdAt: -1 });
     res.json(blogs);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -77,11 +81,11 @@ router.get('/id/:id', async (req, res) => {
 // @route   POST api/blogs/new
 // @desc    Create a new blog post
 router.post('/new', async (req, res) => {
-  const { title, content, tags, author, featuredImage, isPublished, isFeatured } = req.body;
+  const { title, content, tags, category, author, featuredImage, isPublished, isFeatured } = req.body;
 
   try {
     const slug = await makeSlug(title);
-    
+
     // Parse tags if sent as comma-separated string
     let tagsArray = [];
     if (tags) {
@@ -96,6 +100,7 @@ router.post('/new', async (req, res) => {
       title,
       content,
       tags: tagsArray,
+      category: category || '',
       slug,
       author: author || 'Admin',
       featuredImage: featuredImage || '',
@@ -112,7 +117,7 @@ router.post('/new', async (req, res) => {
 // @route   PUT api/blogs/:id
 // @desc    Update blog post by ID
 router.put('/:id', async (req, res) => {
-  const { title, content, tags, author, featuredImage, isPublished, isFeatured } = req.body;
+  const { title, content, tags, category, author, featuredImage, isPublished, isFeatured } = req.body;
 
   try {
     const blog = await Blog.findById(req.params.id);
@@ -123,11 +128,12 @@ router.put('/:id', async (req, res) => {
         blog.slug = await makeSlug(title, blog._id);
       }
       if (content !== undefined) blog.content = content;
+      if (category !== undefined) blog.category = category;
       if (author !== undefined) blog.author = author;
       if (featuredImage !== undefined) blog.featuredImage = featuredImage;
       if (isPublished !== undefined) blog.isPublished = isPublished;
       if (isFeatured !== undefined) blog.isFeatured = isFeatured;
-      
+
       if (tags !== undefined) {
         if (Array.isArray(tags)) {
           blog.tags = tags;

@@ -28,6 +28,7 @@ app.use(async (req, res, next) => {
 app.use('/api/auth',          require('../routes/auth'));
 app.use('/api/auth-otp',      require('../routes/authOtp'));
 app.use('/api/blogs',         require('../routes/blogs'));
+app.use('/api/blog-categories', require('../routes/blogCategories'));
 app.use('/api/categories',    require('../routes/categories'));
 app.use('/api/contacts',      require('../routes/contacts'));
 app.use('/api/contact',       require('../routes/contacts'));
