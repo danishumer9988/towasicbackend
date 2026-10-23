@@ -42,4 +42,15 @@ router.post('/', async (req, res) => {
   }
 });
 
+// @route   PUT api/contacts/mark-read
+// @desc    Mark all contacts as read
+router.put('/mark-read', protect, async (req, res) => {
+  try {
+    await Contact.updateMany({ isRead: false }, { $set: { isRead: true } });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 module.exports = router;

@@ -36,4 +36,15 @@ router.post('/', async (req, res) => {
   }
 });
 
+// @route   PUT api/subscriptions/mark-read
+// @desc    Mark all subscriptions as read
+router.put('/mark-read', protect, async (req, res) => {
+  try {
+    await Subscription.updateMany({ isRead: false }, { $set: { isRead: true } });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 module.exports = router;

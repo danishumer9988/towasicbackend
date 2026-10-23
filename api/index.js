@@ -39,6 +39,7 @@ app.use('/api/projects',      require('../routes/projects'));
 app.use('/api/industries',    require('../routes/industries'));
 app.use('/api/legal', require('../routes/legal'));
 app.use('/api/logs', require('../routes/logs'));
+app.use('/api/stats',         require('../routes/stats'));
 app.use('/api/cron', require('../routes/cron'));
 app.use('/api',               require('../routes/analytics'));
 

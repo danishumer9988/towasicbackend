@@ -5,6 +5,10 @@ const SubscriptionSchema = new mongoose.Schema({
     type: String,
     required: true,
     unique: true
+  },
+  isRead: {
+    type: Boolean,
+    default: false
   }
 }, {
   timestamps: true

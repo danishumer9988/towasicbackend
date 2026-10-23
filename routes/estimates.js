@@ -39,6 +39,17 @@ router.post('/', async (req, res) => {
   }
 });
 
+// @route   PUT api/estimates/mark-read
+// @desc    Mark all estimates as read
+router.put('/mark-read', protect, async (req, res) => {
+  try {
+    await Estimate.updateMany({ isRead: false }, { $set: { isRead: true } });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @route   DELETE api/estimates/:id
 // @desc    Delete a single estimate request
 router.delete('/:id', protect, async (req, res) => {

@@ -24,6 +24,10 @@ const ContactSchema = new mongoose.Schema({
   budget: {
     type: String,
     default: ''
+  },
+  isRead: {
+    type: Boolean,
+    default: false
   }
 }, {
   timestamps: true
