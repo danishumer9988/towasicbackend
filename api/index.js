@@ -4,7 +4,6 @@ const dotenv = require('dotenv');
 const connectDB = require('../config/db');
 
 dotenv.config();
-connectDB();
 
 const app = express();
 
@@ -17,6 +16,7 @@ app.use(async (req, res, next) => {
     await connectDB();
     next();
   } catch (err) {
+    console.error('[DB middleware]', err.message);
     res.status(500).json({
       message: 'Database connection failed. Please verify MONGODB_URI environment variable on Vercel.',
       error: err.message,
@@ -25,26 +25,24 @@ app.use(async (req, res, next) => {
 });
 
 /* ---------- Routes ---------- */
-app.use('/api/auth',          require('../routes/auth'));
-app.use('/api/auth-otp',      require('../routes/authOtp'));
-app.use('/api/blogs',         require('../routes/blogs'));
+app.use('/api/auth',            require('../routes/auth'));
+app.use('/api/auth-otp',        require('../routes/authOtp'));
+app.use('/api/blogs',           require('../routes/blogs'));
 app.use('/api/blog-categories', require('../routes/blogCategories'));
-app.use('/api/categories',    require('../routes/categories'));
-app.use('/api/contacts',      require('../routes/contacts'));
-app.use('/api/contact',       require('../routes/contacts'));
-app.use('/api/estimates',     require('../routes/estimates'));
-app.use('/api/subscriptions', require('../routes/subscriptions'));
-app.use('/api/upload',        require('../routes/upload'));
-app.use('/api/projects',      require('../routes/projects'));
-app.use('/api/industries',    require('../routes/industries'));
-app.use('/api/legal', require('../routes/legal'));
-app.use('/api/logs', require('../routes/logs'));
-app.use('/api/stats',         require('../routes/stats'));
-app.use('/api/cron', require('../routes/cron'));
-app.use('/api',               require('../routes/analytics'));
-app.use('/api/indexnow', require('./routes/indexnow'))
-
-
+app.use('/api/categories',      require('../routes/categories'));
+app.use('/api/contacts',        require('../routes/contacts'));
+app.use('/api/contact',         require('../routes/contacts'));
+app.use('/api/estimates',       require('../routes/estimates'));
+app.use('/api/subscriptions',   require('../routes/subscriptions'));
+app.use('/api/upload',          require('../routes/upload'));
+app.use('/api/projects',        require('../routes/projects'));
+app.use('/api/industries',      require('../routes/industries'));
+app.use('/api/legal',           require('../routes/legal'));
+app.use('/api/logs',            require('../routes/logs'));
+app.use('/api/stats',           require('../routes/stats'));
+app.use('/api/cron',            require('../routes/cron'));
+app.use('/api/indexnow',        require('../routes/indexnow'));   // ← ✅ FIXED PATH
+app.use('/api',                 require('../routes/analytics'));
 
 /* ---------- Health check ---------- */
 app.get('/health', (req, res) => {
