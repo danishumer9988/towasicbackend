@@ -15,7 +15,7 @@ router.get('/', protect, async (req, res) => {
 });
 
 // @route   POST api/subscriptions
-// @desc    Create a new email subscription (public — called by footer form)
+// @desc    Create a new email subscription
 router.post('/', async (req, res) => {
   const { email } = req.body;
 
