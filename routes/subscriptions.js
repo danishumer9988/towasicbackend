@@ -15,7 +15,7 @@ router.get('/', protect, async (req, res) => {
 });
 
 // @route   POST api/subscriptions
-// @desc    Create a new email subscription
+// @desc    Create a new email subscription (public — called by footer form)
 router.post('/', async (req, res) => {
   const { email } = req.body;
 
@@ -42,6 +42,43 @@ router.put('/mark-read', protect, async (req, res) => {
   try {
     await Subscription.updateMany({ isRead: false }, { $set: { isRead: true } });
     res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @route   DELETE api/subscriptions/:id
+// @desc    Delete a single subscription
+router.delete('/:id', protect, async (req, res) => {
+  try {
+    const result = await Subscription.deleteOne({ _id: req.params.id });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: 'Subscription not found' });
+    }
+
+    res.json({ message: 'Subscription removed successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @route   POST api/subscriptions/bulk-delete
+// @desc    Delete multiple subscriptions
+// @body    { ids: ['id1', 'id2', ...] }
+router.post('/bulk-delete', protect, async (req, res) => {
+  const { ids } = req.body || {};
+
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: 'No subscription IDs provided' });
+  }
+
+  try {
+    const result = await Subscription.deleteMany({ _id: { $in: ids } });
+    res.json({
+      success: true,
+      deletedCount: result.deletedCount,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

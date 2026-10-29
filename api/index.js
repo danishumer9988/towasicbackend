@@ -42,6 +42,7 @@ app.use('/api/logs', require('../routes/logs'));
 app.use('/api/stats',         require('../routes/stats'));
 app.use('/api/cron', require('../routes/cron'));
 app.use('/api',               require('../routes/analytics'));
+app.use('/api/indexnow', require('./routes/indexnow'))
 
 
 
