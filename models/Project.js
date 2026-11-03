@@ -1,5 +1,10 @@
 const mongoose = require('mongoose');
 
+const DescriptionBlockSchema = new mongoose.Schema({
+  heading: { type: String, default: '' },
+  content: { type: String, default: '' }, // HTML from RichTextEditor
+}, { _id: false });
+
 const ProjectSchema = new mongoose.Schema({
   projectNumber: {
     type: Number,
@@ -9,9 +14,16 @@ const ProjectSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  // NEW: array of rich-text description blocks
+  descriptions: {
+    type: [DescriptionBlockSchema],
+    default: []
+  },
+  // LEGACY: kept for backward compatibility + admin table preview
+  // (derived from the first block's plain text on save)
   description: {
     type: String,
-    required: true
+    default: ''
   },
   link: {
     type: String,
