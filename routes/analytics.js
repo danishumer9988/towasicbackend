@@ -32,7 +32,7 @@ const Visitor = mongoose.model('Visitor', new mongoose.Schema({
   last_seen:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
 
-/* ---------- Declined / Unknown visitors (IP kept for 90d, Record kept for 12mo) ---------- */
+/* ---------- Declined / Unknown visitors ---------- */
 const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
   visitor_id: { type: String, required: true, unique: true, index: true },
   ip:         { type: String, required: true, index: true },
@@ -220,6 +220,29 @@ const strip = (doc) => {
   if (!doc) return doc;
   const { _id, __v, ...rest } = doc;
   return { ...rest, id: _id.toString() };
+};
+
+/* ── NEW: heuristic session count from a single consent-log row ── */
+const estimateSessions = (log) => {
+  if (!log.startTime || !log.endTime) return 1;
+  const start = new Date(log.startTime).getTime();
+  const end   = new Date(log.endTime).getTime();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const sDay  = Math.floor(start / dayMs);
+  const eDay  = Math.floor(end   / dayMs);
+  const distinctDays = eDay - sDay + 1;
+  if (distinctDays > 1) return distinctDays;
+  return (end - start) > 60 * 60 * 1000 ? 2 : 1;
+};
+
+/* ── NEW: classify a consent-log row as returning (heuristic) ── */
+const isReturningLog = (l) => {
+  if (!l.startTime || !l.endTime) return false;
+  const ms = new Date(l.endTime).getTime() - new Date(l.startTime).getTime();
+  if (ms > 60 * 60 * 1000) return true;
+  const sDay = new Date(l.startTime).toISOString().slice(0, 10);
+  const eDay = new Date(l.endTime).toISOString().slice(0, 10);
+  return sDay !== eDay;
 };
 
 /* ---------- Accepted visitor: write-once upsert ---------- */
@@ -501,8 +524,10 @@ router.get('/analytics', protect, async (req, res) => {
 
       const [
         uv, ss, pv, cl, avgRow, activeNow, bounced,
-        visitorStats,       // ← replaces old newVs
-        avgPerSession, declinedCount, unknownCount,
+        acceptedStats,
+        avgPerSession,
+        declinedLogs,
+        unknownLogs,
       ] = await Promise.all([
         Visitor.countDocuments({ last_seen: bounds }),
         Session.countDocuments({ started_at: bounds }),
@@ -515,7 +540,7 @@ router.get('/analytics', protect, async (req, res) => {
         Visitor.countDocuments({ last_seen: { $gte: fiveMinAgo } }),
         Session.countDocuments({ started_at: bounds, page_views: { $lte: 1 } }),
 
-        // ── NEW: classify by TOTAL session count (ever) ──
+        // Accepted: exact one-time vs repeat (by lifetime session count)
         Visitor.aggregate([
           { $match: { last_seen: bounds } },
           { $lookup: {
@@ -527,7 +552,8 @@ router.get('/analytics', protect, async (req, res) => {
           { $project: { sessionCount: { $size: '$vs' } } },
           { $group: {
               _id: null,
-              repeat: { $sum: { $cond: [{ $gt: ['$sessionCount', 1] }, 1, 0] } },
+              oneTime: { $sum: { $cond: [{ $eq: ['$sessionCount', 1] }, 1, 0] } },
+              repeat:  { $sum: { $cond: [{ $gt: ['$sessionCount', 1] }, 1, 0] } },
           } },
         ]),
 
@@ -535,33 +561,60 @@ router.get('/analytics', protect, async (req, res) => {
           { $match: { started_at: bounds } },
           { $group: { _id: null, avgPages: { $avg: '$page_views' }, avgClicks: { $avg: '$clicks' } } },
         ]),
-        SecurityLog.countDocuments({ endTime: bounds, consent: 'declined' }),
-        SecurityLog.countDocuments({ endTime: bounds, consent: 'unknown' }),
+
+        SecurityLog.find({ endTime: bounds, consent: 'declined' })
+          .select('startTime endTime')
+          .lean(),
+
+        SecurityLog.find({ endTime: bounds, consent: 'unknown' })
+          .select('startTime endTime')
+          .lean(),
       ]);
 
-      const repeatCount  = visitorStats[0]?.repeat || 0;
-      const oneTimeCount = Math.max(0, uv - repeatCount);
+      /* ---- classify declined / unknown via heuristic ---- */
+      const declinedRepeat  = declinedLogs.filter(isReturningLog).length;
+      const declinedOneTime = declinedLogs.length - declinedRepeat;
+      const unknownRepeat   = unknownLogs.filter(isReturningLog).length;
+      const unknownOneTime  = unknownLogs.length - unknownRepeat;
 
-      // User's requested Total = ALL 5 categories summed
-      const totalVisitors =
-        uv + declinedCount + unknownCount + oneTimeCount + repeatCount;
+      const acceptedOneTime = acceptedStats[0]?.oneTime || 0;
+      const acceptedRepeat  = acceptedStats[0]?.repeat  || 0;
+
+      /* ---- combined new / returning across ALL consent states ---- */
+      const newVisitorsTotal       = acceptedOneTime + declinedOneTime + unknownOneTime;
+      const returningVisitorsTotal = acceptedRepeat  + declinedRepeat  + unknownRepeat;
+
+      /* ---- session estimates across ALL consent states ---- */
+      const declinedSessionsEstimate = declinedLogs.reduce((s, l) => s + estimateSessions(l), 0);
+      const unknownSessionsEstimate  = unknownLogs.reduce((s, l) => s + estimateSessions(l), 0);
+      const totalSessionsAll         = ss + declinedSessionsEstimate + unknownSessionsEstimate;
+
+      const declinedCount = declinedLogs.length;
+      const unknownCount  = unknownLogs.length;
 
       return res.json({
         uniqueVisitors:      uv,
         acceptedVisitors:    uv,
         declinedVisitors:    declinedCount,
         unknownVisitors:     unknownCount,
-        totalVisitors,                       // ← now includes new + returning
+        totalVisitors:       uv + declinedCount + unknownCount,
         sessions:            ss,
         pageViews:           pv,
         clicks:              cl,
         avgSessionMs:        Math.round(avgRow[0]?.avg || 0),
         activeNow:           activeNow,
         bounceRate:          ss ? bounced / ss : 0,
-        newVisitors:         oneTimeCount,   // = one-time
-        returningVisitors:   repeatCount,    // = repeat
+        newVisitors:         newVisitorsTotal,
+        returningVisitors:   returningVisitorsTotal,
         avgPagesPerSession:  +(avgPerSession[0]?.avgPages  || 0).toFixed(2),
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
+
+        // ── session totals across all consent states ──
+        totalSessionsAll,
+        acceptedSessions:          ss,
+        declinedSessionsEstimate,
+        unknownSessionsEstimate,
+
         consentAccepted: uv,
         consentDeclined: declinedCount,
         consentUnknown:  unknownCount,
@@ -639,6 +692,7 @@ router.get('/analytics', protect, async (req, res) => {
         durationMs: l.endTime && l.startTime
           ? new Date(l.endTime).getTime() - new Date(l.startTime).getTime()
           : 0,
+        estimatedSessions: estimateSessions(l),
       })));
     }
 
@@ -647,11 +701,12 @@ router.get('/analytics', protect, async (req, res) => {
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'Missing id' });
 
-      const [visitor, sessions, pageViews, activities] = await Promise.all([
+      const [visitor, sessions, pageViews, activities, visitCount] = await Promise.all([
         Visitor.findOne({ visitor_id: id }).lean(),
         Session.find({ visitor_id: id }).sort({ started_at: -1 }).limit(100).lean(),
         PageView.find({ visitor_id: id }).sort({ timestamp: -1 }).limit(500).lean(),
         Activity.find({ visitor_id: id }).sort({ timestamp: -1 }).limit(500).lean(),
+        Session.countDocuments({ visitor_id: id }),
       ]);
 
       if (!visitor) return res.status(404).json({ error: 'Not found' });
@@ -663,6 +718,7 @@ router.get('/analytics', protect, async (req, res) => {
           viewport_w: visitor.vw, viewport_h: visitor.vh,
           consent:    'accepted',
         },
+        visitCount,
         sessions:   sessions.map((s) => ({ ...strip(s), landing_page: s.landing, exit_page: s.exit })),
         pageViews:  pageViews.map(strip),
         activities: activities.map(strip),
