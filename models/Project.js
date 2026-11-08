@@ -14,13 +14,10 @@ const ProjectSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  // NEW: array of rich-text description blocks
   descriptions: {
     type: [DescriptionBlockSchema],
     default: []
   },
-  // LEGACY: kept for backward compatibility + admin table preview
-  // (derived from the first block's plain text on save)
   description: {
     type: String,
     default: ''
@@ -44,6 +41,11 @@ const ProjectSchema = new mongoose.Schema({
   featured: {
     type: Boolean,
     default: false
+  },
+  // NEW: whether this project is visible on the public site
+  isActive: {
+    type: Boolean,
+    default: true
   },
   images: [{
     type: String

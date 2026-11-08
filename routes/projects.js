@@ -3,11 +3,18 @@ const router = express.Router();
 const Project = require('../models/Project');
 const { protect } = require('../middleware/auth');
 
-// GET all projects (optional ?industry=slug &featured=true|false filter)
+// GET all projects
+// Query params:
+//   ?industry=slug
+//   ?featured=true|false
+//   ?active=true           → only active projects (for public pages)
+//   ?all=true              → bypass isActive filter (for admin, though default includes all)
 router.get('/', async (req, res) => {
   try {
     const filter = {};
+
     if (req.query.industry) filter.industry = req.query.industry;
+
     if (req.query.featured !== undefined) {
       if (req.query.featured === 'true') {
         filter.featured = true;
@@ -15,6 +22,13 @@ router.get('/', async (req, res) => {
         filter.featured = { $ne: true };
       }
     }
+
+    // NEW: ?active=true returns only active projects.
+    // Documents without the field (legacy) are treated as active.
+    if (req.query.active === 'true') {
+      filter.isActive = { $ne: false };
+    }
+
     const projects = await Project.find(filter).sort({ projectNumber: 1 });
     res.json(projects);
   } catch (error) {
@@ -41,10 +55,9 @@ const normalizeDescriptions = (raw) => {
       heading: typeof b?.heading === 'string' ? b.heading.trim() : '',
       content: typeof b?.content === 'string' ? b.content.trim() : '',
     }))
-    .filter((b) => b.heading || b.content); // drop completely empty blocks
+    .filter((b) => b.heading || b.content);
 };
 
-// Helper: derive a plain-text legacy `description` from the first block
 const htmlToText = (html = '') =>
   html
     .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -58,13 +71,11 @@ const htmlToText = (html = '') =>
 router.post('/', protect, async (req, res) => {
   const {
     projectNumber, title, descriptions, description,
-    images, link, videoLink, industry, blurImage, featured,
+    images, link, videoLink, industry, blurImage, featured, isActive,
   } = req.body;
 
   const blocks = normalizeDescriptions(descriptions);
 
-  // Validation: need number, title, and at least one description block
-  // (or a legacy single description string)
   const hasBlocks = blocks && blocks.length > 0;
   const hasLegacy = typeof description === 'string' && description.trim().length > 0;
 
@@ -74,12 +85,10 @@ router.post('/', protect, async (req, res) => {
     });
   }
 
-  // Resolve final blocks: prefer `descriptions[]`, else wrap legacy string
   const finalBlocks = hasBlocks
     ? blocks
     : [{ heading: '', content: String(description).trim() }];
 
-  // Legacy plain-text description derived from the first block
   const legacyDescription = htmlToText(finalBlocks[0].content);
 
   try {
@@ -93,6 +102,7 @@ router.post('/', protect, async (req, res) => {
       industry: industry || '',
       blurImage: !!blurImage,
       featured: !!featured,
+      isActive: isActive !== undefined ? !!isActive : true,  // NEW
       images: images || [],
     });
     res.status(201).json(project);
@@ -101,11 +111,11 @@ router.post('/', protect, async (req, res) => {
   }
 });
 
-// PUT update project
+// PUT update project (also handles isActive toggle from admin)
 router.put('/:id', protect, async (req, res) => {
   const {
     projectNumber, title, descriptions, description,
-    images, link, videoLink, industry, blurImage, featured,
+    images, link, videoLink, industry, blurImage, featured, isActive,
   } = req.body;
 
   try {
@@ -115,7 +125,6 @@ router.put('/:id', protect, async (req, res) => {
     if (projectNumber !== undefined) project.projectNumber = Number(projectNumber);
     if (title !== undefined) project.title = title;
 
-    // Handle descriptions: prefer new array, fall back to legacy string
     if (descriptions !== undefined) {
       const blocks = normalizeDescriptions(descriptions);
       if (!blocks || blocks.length === 0) {
@@ -124,7 +133,6 @@ router.put('/:id', protect, async (req, res) => {
       project.descriptions = blocks;
       project.description = htmlToText(blocks[0].content);
     } else if (description !== undefined) {
-      // Legacy client: wrap the plain string into a single block
       const text = String(description).trim();
       if (!text) {
         return res.status(400).json({ message: 'Description cannot be empty' });
@@ -139,6 +147,7 @@ router.put('/:id', protect, async (req, res) => {
     if (industry !== undefined) project.industry = industry;
     if (blurImage !== undefined) project.blurImage = !!blurImage;
     if (featured !== undefined) project.featured = !!featured;
+    if (isActive !== undefined) project.isActive = !!isActive;   // NEW
 
     const updated = await project.save();
     res.json(updated);
