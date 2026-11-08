@@ -500,8 +500,9 @@ router.get('/analytics', protect, async (req, res) => {
       const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
 
       const [
-        uv, ss, pv, cl, avgRow, activeNow, bounced, newVs, avgPerSession,
-        declinedCount, unknownCount,
+        uv, ss, pv, cl, avgRow, activeNow, bounced,
+        visitorStats,       // ← replaces old newVs
+        avgPerSession, declinedCount, unknownCount,
       ] = await Promise.all([
         Visitor.countDocuments({ last_seen: bounds }),
         Session.countDocuments({ started_at: bounds }),
@@ -513,10 +514,23 @@ router.get('/analytics', protect, async (req, res) => {
         ]),
         Visitor.countDocuments({ last_seen: { $gte: fiveMinAgo } }),
         Session.countDocuments({ started_at: bounds, page_views: { $lte: 1 } }),
-        Promise.all([
-          Visitor.countDocuments({ first_seen: bounds, last_seen: bounds }),
-          Visitor.countDocuments({ last_seen: bounds }),
+
+        // ── NEW: classify by TOTAL session count (ever) ──
+        Visitor.aggregate([
+          { $match: { last_seen: bounds } },
+          { $lookup: {
+              from: 'sessions',
+              localField: 'visitor_id',
+              foreignField: 'visitor_id',
+              as: 'vs',
+          } },
+          { $project: { sessionCount: { $size: '$vs' } } },
+          { $group: {
+              _id: null,
+              repeat: { $sum: { $cond: [{ $gt: ['$sessionCount', 1] }, 1, 0] } },
+          } },
         ]),
+
         Session.aggregate([
           { $match: { started_at: bounds } },
           { $group: { _id: null, avgPages: { $avg: '$page_views' }, avgClicks: { $avg: '$clicks' } } },
@@ -525,20 +539,27 @@ router.get('/analytics', protect, async (req, res) => {
         SecurityLog.countDocuments({ endTime: bounds, consent: 'unknown' }),
       ]);
 
+      const repeatCount  = visitorStats[0]?.repeat || 0;
+      const oneTimeCount = Math.max(0, uv - repeatCount);
+
+      // User's requested Total = ALL 5 categories summed
+      const totalVisitors =
+        uv + declinedCount + unknownCount + oneTimeCount + repeatCount;
+
       return res.json({
         uniqueVisitors:      uv,
         acceptedVisitors:    uv,
         declinedVisitors:    declinedCount,
         unknownVisitors:     unknownCount,
-        totalVisitors:       uv + declinedCount + unknownCount,
+        totalVisitors,                       // ← now includes new + returning
         sessions:            ss,
         pageViews:           pv,
         clicks:              cl,
         avgSessionMs:        Math.round(avgRow[0]?.avg || 0),
         activeNow:           activeNow,
         bounceRate:          ss ? bounced / ss : 0,
-        newVisitors:         newVs[0],
-        returningVisitors:   Math.max(0, newVs[1] - newVs[0]),
+        newVisitors:         oneTimeCount,   // = one-time
+        returningVisitors:   repeatCount,    // = repeat
         avgPagesPerSession:  +(avgPerSession[0]?.avgPages  || 0).toFixed(2),
         avgClicksPerSession: +(avgPerSession[0]?.avgClicks || 0).toFixed(2),
         consentAccepted: uv,
