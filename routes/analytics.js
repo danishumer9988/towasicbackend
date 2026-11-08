@@ -38,7 +38,7 @@ const SecurityLog = mongoose.model('SecurityLog', new mongoose.Schema({
   ip:         { type: String, required: true, index: true },
   consent:    { type: String, enum: ['declined', 'unknown'], required: true, index: true },
   startTime:  { type: Date, required: true },
-  endTime:    { type: Date, required: true, index: true, expires: TTL_365D }, // Updated to 12 months
+  endTime:    { type: Date, required: true, index: true, expires: TTL_365D },
 }, { collection: 'visitor_consent_logs' }));
 
 const Session = mongoose.model('Session', new mongoose.Schema({
@@ -51,7 +51,7 @@ const Session = mongoose.model('Session', new mongoose.Schema({
   clicks:      { type: Number, default: 0 },
   duration_ms: { type: Number, default: 0 },
   started_at:  { type: Date, default: Date.now, index: true },
-  ended_at:    { type: Date, default: Date.now, expires: TTL_90D }, // Added TTL
+  ended_at:    { type: Date, default: Date.now, expires: TTL_90D },
 }));
 
 const PageView = mongoose.model('PageView', new mongoose.Schema({
@@ -73,8 +73,6 @@ const Activity = mongoose.model('Activity', new mongoose.Schema({
   destination: { type: String, default: '' },
   timestamp:   { type: Date, default: Date.now, index: true, expires: TTL_90D },
 }));
-
-// ... (REST OF YOUR analytics.js FILE REMAINS EXACTLY THE SAME)
 
 /* ============================================================
    HELPERS
@@ -191,8 +189,6 @@ const hostOf = (url = '') => {
   try { return new URL(url).hostname; } catch { return ''; }
 };
 
-/* tz = browser's getTimezoneOffset() in minutes (UTC - local).
-   Pakistan (UTC+5) sends -300. Makes "Today" mean the admin's today. */
 const parseTz = (v) => {
   const n = parseInt(v, 10);
   return Number.isFinite(n) && n >= -840 && n <= 840 ? n : 0;
@@ -299,38 +295,51 @@ const toStartDate = (ms) => {
 };
 
 /* overwrite = true  -> declined: always wins over an existing unknown row
-   overwrite = false -> unknown : only created if nothing exists yet        */
+   overwrite = false -> unknown : extends endTime on return visits           */
 async function saveConsentLog({ visitorId, ip, consent, startedAt, overwrite }) {
   const now = new Date();
   const start = toStartDate(startedAt);
   try {
     if (overwrite) {
+      // declined: overwrite the row (updates endTime, sets consent='declined')
       await SecurityLog.updateOne(
         { visitor_id: visitorId },
         { $set: { ip, consent, endTime: now }, $setOnInsert: { startTime: start } },
         { upsert: true }
       );
     } else {
-      await SecurityLog.updateOne(
-        { visitor_id: visitorId },
-        { $setOnInsert: { ip, consent, startTime: start, endTime: now } },
-        { upsert: true }
+      // unknown:
+      //   1) existing 'unknown' row  → extend endTime (returning visitor)
+      //   2) no row at all            → create one
+      //   3) existing 'declined' row  → leave untouched (declined wins)
+      const updated = await SecurityLog.updateOne(
+        { visitor_id: visitorId, consent: 'unknown' },
+        { $set: { endTime: now, ip } }
       );
+
+      if (updated.matchedCount === 0) {
+        try {
+          await SecurityLog.create({
+            visitor_id: visitorId,
+            ip,
+            consent: 'unknown',
+            startTime: start,
+            endTime: now,
+          });
+        } catch (err) {
+          // Row exists with a different consent (declined), or two exits raced → ignore
+          if (!err || err.code !== 11000) throw err;
+        }
+      }
     }
   } catch (err) {
-    if (err && err.code === 11000) return; // two requests raced; row already exists
+    if (err && err.code === 11000) return;
     throw err;
   }
 }
 
 /* ============================================================
    POST /api/track
-
-   Priority:  accepted  >  declined  >  unknown
-   - accepted : full tracking, removes any declined/unknown row
-   - declined : 5-field row, removes "unknown" (same row is reused)
-   - unknown  : only saved on tab close ('exit'), 5-field row
-   - once accepted, declined/unknown signals are ignored
    ============================================================ */
 router.post('/track', express.text({ type: 'text/plain', limit: '16kb' }), async (req, res) => {
   try {
@@ -372,7 +381,6 @@ router.post('/track', express.text({ type: 'text/plain', limit: '16kb' }), async
 
     /* ================= NOT ACCEPTED ================= */
     if (consent !== 'accepted') {
-      // Accepted is final. Never downgrade.
       if (await Visitor.exists({ visitor_id: visitorId })) {
         return res.json({ ok: true, consent, stored: 'ignored-already-accepted' });
       }
@@ -387,7 +395,6 @@ router.post('/track', express.text({ type: 'text/plain', limit: '16kb' }), async
         stored = 'unknown-log';
       }
 
-      // If the visitor got accepted while this request was running, drop the stray row.
       if (stored !== 'skipped' && await Visitor.exists({ visitor_id: visitorId })) {
         await SecurityLog.deleteOne({ visitor_id: visitorId });
         stored = 'ignored-already-accepted';
@@ -409,7 +416,6 @@ router.post('/track', express.text({ type: 'text/plain', limit: '16kb' }), async
       page: path, geo, screen, viewport, clientGeo,
     });
 
-    // New accepted visitor: remove their declined / unknown row (if any).
     if (!existing) {
       await SecurityLog.deleteOne({ visitor_id: visitorId });
     }
@@ -524,6 +530,7 @@ router.get('/analytics', protect, async (req, res) => {
         acceptedVisitors:    uv,
         declinedVisitors:    declinedCount,
         unknownVisitors:     unknownCount,
+        totalVisitors:       uv + declinedCount + unknownCount,
         sessions:            ss,
         pageViews:           pv,
         clicks:              cl,
