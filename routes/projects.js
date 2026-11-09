@@ -3,7 +3,6 @@ const router = express.Router();
 const Project = require('../models/Project');
 const { protect } = require('../middleware/auth');
 
-/* ---------- helpers ---------- */
 const clamp = (v, min, max) => {
   const n = Number(v);
   if (!Number.isFinite(n)) return min;
@@ -12,8 +11,6 @@ const clamp = (v, min, max) => {
 
 const normalizeImage = (item) => {
   if (!item) return null;
-
-  // Legacy string entry
   if (typeof item === 'string') {
     const url = item.trim();
     return url ? { url, effects: null } : null;
@@ -27,16 +24,17 @@ const normalizeImage = (item) => {
     effects = {
       enabled:    !!item.effects.enabled,
       type:       item.effects.type === 'pixelate' ? 'pixelate' : 'box',
-      radius:     clamp(item.effects.radius     ?? 12,  0,   40),
+      radius:     clamp(item.effects.radius     ?? 4,   0,   40),    // Updated
       brightness: clamp(item.effects.brightness ?? 100, 50,  150),
       contrast:   clamp(item.effects.contrast   ?? 100, 50,  150),
       saturation: clamp(item.effects.saturation ?? 100, 0,   200),
-      sharpness:  clamp(item.effects.sharpness  ?? 0,   0,   100),
+      sharpness:  clamp(item.effects.sharpness  ?? 80,  0,   100),   // Updated
     };
   }
 
   return { url, effects };
 };
+// ... rest of the file stays exactly the same as before
 
 const normalizeImages = (raw) => {
   if (!Array.isArray(raw)) return [];
