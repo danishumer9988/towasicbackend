@@ -4,17 +4,31 @@ const Project = require('../models/Project');
 const { protect } = require('../middleware/auth');
 
 // GET all projects
+// Query params:
+//   ?industry=slug
+//   ?featured=true|false
+//   ?active=true           → only active projects (for public pages)
+//   ?all=true              → bypass isActive filter (for admin, though default includes all)
 router.get('/', async (req, res) => {
   try {
     const filter = {};
+
     if (req.query.industry) filter.industry = req.query.industry;
+
     if (req.query.featured !== undefined) {
-      if (req.query.featured === 'true') filter.featured = true;
-      else filter.featured = { $ne: true };
+      if (req.query.featured === 'true') {
+        filter.featured = true;
+      } else {
+        filter.featured = { $ne: true };
+      }
     }
+
+    // NEW: ?active=true returns only active projects.
+    // Documents without the field (legacy) are treated as active.
     if (req.query.active === 'true') {
       filter.isActive = { $ne: false };
     }
+
     const projects = await Project.find(filter).sort({ projectNumber: 1 });
     res.json(projects);
   } catch (error) {
@@ -33,27 +47,25 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Helpers
+// Helper: normalize incoming descriptions (accept array of {heading, content})
 const normalizeDescriptions = (raw) => {
   if (!Array.isArray(raw)) return null;
-  return raw.map((b) => ({
+  return raw
+    .map((b) => ({
       heading: typeof b?.heading === 'string' ? b.heading.trim() : '',
       content: typeof b?.content === 'string' ? b.content.trim() : '',
-    })).filter((b) => b.heading || b.content);
-};
-
-// NEW: Helper to ensure old string arrays are converted to the new object format
-const normalizeImages = (images, legacyBlur) => {
-  if (!Array.isArray(images)) return [];
-  return images.map(img => {
-    if (typeof img === 'string') return { url: img, blurred: !!legacyBlur };
-    return { url: img.url, blurred: !!img.blurred };
-  }).filter(img => img.url); // drop empty images
+    }))
+    .filter((b) => b.heading || b.content);
 };
 
 const htmlToText = (html = '') =>
-  html.replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+  html
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 // POST create project
 router.post('/', protect, async (req, res) => {
@@ -63,14 +75,20 @@ router.post('/', protect, async (req, res) => {
   } = req.body;
 
   const blocks = normalizeDescriptions(descriptions);
+
   const hasBlocks = blocks && blocks.length > 0;
   const hasLegacy = typeof description === 'string' && description.trim().length > 0;
 
   if (projectNumber === undefined || !title || (!hasBlocks && !hasLegacy)) {
-    return res.status(400).json({ message: 'Project number, title, and at least one description block are required' });
+    return res.status(400).json({
+      message: 'Project number, title, and at least one description block are required',
+    });
   }
 
-  const finalBlocks = hasBlocks ? blocks : [{ heading: '', content: String(description).trim() }];
+  const finalBlocks = hasBlocks
+    ? blocks
+    : [{ heading: '', content: String(description).trim() }];
+
   const legacyDescription = htmlToText(finalBlocks[0].content);
 
   try {
@@ -84,8 +102,8 @@ router.post('/', protect, async (req, res) => {
       industry: industry || '',
       blurImage: !!blurImage,
       featured: !!featured,
-      isActive: isActive !== undefined ? !!isActive : true,
-      images: normalizeImages(images, blurImage), // Apply the helper here
+      isActive: isActive !== undefined ? !!isActive : true,  // NEW
+      images: images || [],
     });
     res.status(201).json(project);
   } catch (error) {
@@ -93,7 +111,7 @@ router.post('/', protect, async (req, res) => {
   }
 });
 
-// PUT update project
+// PUT update project (also handles isActive toggle from admin)
 router.put('/:id', protect, async (req, res) => {
   const {
     projectNumber, title, descriptions, description,
@@ -116,19 +134,20 @@ router.put('/:id', protect, async (req, res) => {
       project.description = htmlToText(blocks[0].content);
     } else if (description !== undefined) {
       const text = String(description).trim();
-      if (!text) return res.status(400).json({ message: 'Description cannot be empty' });
+      if (!text) {
+        return res.status(400).json({ message: 'Description cannot be empty' });
+      }
       project.descriptions = [{ heading: '', content: text }];
       project.description = htmlToText(text);
     }
 
-    // Apply the helper here too
-    if (images !== undefined) project.images = normalizeImages(images, blurImage);
+    if (images !== undefined) project.images = images;
     if (link !== undefined) project.link = link;
     if (videoLink !== undefined) project.videoLink = videoLink;
     if (industry !== undefined) project.industry = industry;
     if (blurImage !== undefined) project.blurImage = !!blurImage;
     if (featured !== undefined) project.featured = !!featured;
-    if (isActive !== undefined) project.isActive = !!isActive;
+    if (isActive !== undefined) project.isActive = !!isActive;   // NEW
 
     const updated = await project.save();
     res.json(updated);
