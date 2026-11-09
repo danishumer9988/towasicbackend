@@ -5,6 +5,12 @@ const DescriptionBlockSchema = new mongoose.Schema({
   content: { type: String, default: '' }, // HTML from RichTextEditor
 }, { _id: false });
 
+// NEW: Image Schema
+const ImageSchema = new mongoose.Schema({
+  url: { type: String, required: true },
+  blurred: { type: Boolean, default: false }
+}, { _id: false });
+
 const ProjectSchema = new mongoose.Schema({
   projectNumber: {
     type: Number,
@@ -34,6 +40,7 @@ const ProjectSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  // Kept for backward compatibility with old projects
   blurImage: {
     type: Boolean,
     default: false
@@ -42,14 +49,15 @@ const ProjectSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
-  // NEW: whether this project is visible on the public site
   isActive: {
     type: Boolean,
     default: true
   },
-  images: [{
-    type: String
-  }]
+  // CHANGED: Now uses the ImageSchema array
+  images: {
+    type: [ImageSchema],
+    default: []
+  }
 }, {
   timestamps: true
 });
