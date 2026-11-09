@@ -3,28 +3,78 @@ const router = express.Router();
 const Project = require('../models/Project');
 const { protect } = require('../middleware/auth');
 
+/* ---------- helpers ---------- */
+const clamp = (v, min, max) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, n));
+};
+
+const normalizeImage = (item) => {
+  if (!item) return null;
+
+  // Legacy string entry
+  if (typeof item === 'string') {
+    const url = item.trim();
+    return url ? { url, effects: null } : null;
+  }
+
+  const url = typeof item.url === 'string' ? item.url.trim() : '';
+  if (!url) return null;
+
+  let effects = null;
+  if (item.effects && typeof item.effects === 'object') {
+    effects = {
+      enabled:    !!item.effects.enabled,
+      type:       item.effects.type === 'pixelate' ? 'pixelate' : 'box',
+      radius:     clamp(item.effects.radius     ?? 12,  0,   40),
+      brightness: clamp(item.effects.brightness ?? 100, 50,  150),
+      contrast:   clamp(item.effects.contrast   ?? 100, 50,  150),
+      saturation: clamp(item.effects.saturation ?? 100, 0,   200),
+      sharpness:  clamp(item.effects.sharpness  ?? 0,   0,   100),
+    };
+  }
+
+  return { url, effects };
+};
+
+const normalizeImages = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeImage).filter(Boolean);
+};
+
+const normalizeDescriptions = (raw) => {
+  if (!Array.isArray(raw)) return null;
+  return raw
+    .map((b) => ({
+      heading: typeof b?.heading === 'string' ? b.heading.trim() : '',
+      content: typeof b?.content === 'string' ? b.content.trim() : '',
+    }))
+    .filter((b) => b.heading || b.content);
+};
+
+const htmlToText = (html = '') =>
+  html
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/* ---------- routes ---------- */
+
 // GET all projects
-// Query params:
-//   ?industry=slug
-//   ?featured=true|false
-//   ?active=true           → only active projects (for public pages)
-//   ?all=true              → bypass isActive filter (for admin, though default includes all)
 router.get('/', async (req, res) => {
   try {
     const filter = {};
-
     if (req.query.industry) filter.industry = req.query.industry;
 
     if (req.query.featured !== undefined) {
-      if (req.query.featured === 'true') {
-        filter.featured = true;
-      } else {
-        filter.featured = { $ne: true };
-      }
+      if (req.query.featured === 'true') filter.featured = true;
+      else filter.featured = { $ne: true };
     }
 
-    // NEW: ?active=true returns only active projects.
-    // Documents without the field (legacy) are treated as active.
     if (req.query.active === 'true') {
       filter.isActive = { $ne: false };
     }
@@ -47,26 +97,6 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Helper: normalize incoming descriptions (accept array of {heading, content})
-const normalizeDescriptions = (raw) => {
-  if (!Array.isArray(raw)) return null;
-  return raw
-    .map((b) => ({
-      heading: typeof b?.heading === 'string' ? b.heading.trim() : '',
-      content: typeof b?.content === 'string' ? b.content.trim() : '',
-    }))
-    .filter((b) => b.heading || b.content);
-};
-
-const htmlToText = (html = '') =>
-  html
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
 // POST create project
 router.post('/', protect, async (req, res) => {
   const {
@@ -75,7 +105,6 @@ router.post('/', protect, async (req, res) => {
   } = req.body;
 
   const blocks = normalizeDescriptions(descriptions);
-
   const hasBlocks = blocks && blocks.length > 0;
   const hasLegacy = typeof description === 'string' && description.trim().length > 0;
 
@@ -102,8 +131,8 @@ router.post('/', protect, async (req, res) => {
       industry: industry || '',
       blurImage: !!blurImage,
       featured: !!featured,
-      isActive: isActive !== undefined ? !!isActive : true,  // NEW
-      images: images || [],
+      isActive: isActive !== undefined ? !!isActive : true,
+      images: normalizeImages(images),
     });
     res.status(201).json(project);
   } catch (error) {
@@ -111,7 +140,7 @@ router.post('/', protect, async (req, res) => {
   }
 });
 
-// PUT update project (also handles isActive toggle from admin)
+// PUT update project (also handles isActive / per-image effects toggles from admin)
 router.put('/:id', protect, async (req, res) => {
   const {
     projectNumber, title, descriptions, description,
@@ -123,7 +152,13 @@ router.put('/:id', protect, async (req, res) => {
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     if (projectNumber !== undefined) project.projectNumber = Number(projectNumber);
-    if (title !== undefined) project.title = title;
+    if (title !== undefined)         project.title = title;
+    if (link !== undefined)          project.link = link;
+    if (videoLink !== undefined)     project.videoLink = videoLink;
+    if (industry !== undefined)      project.industry = industry;
+    if (featured !== undefined)      project.featured = !!featured;
+    if (isActive !== undefined)      project.isActive = !!isActive;
+    if (blurImage !== undefined)     project.blurImage = !!blurImage;
 
     if (descriptions !== undefined) {
       const blocks = normalizeDescriptions(descriptions);
@@ -134,20 +169,14 @@ router.put('/:id', protect, async (req, res) => {
       project.description = htmlToText(blocks[0].content);
     } else if (description !== undefined) {
       const text = String(description).trim();
-      if (!text) {
-        return res.status(400).json({ message: 'Description cannot be empty' });
-      }
+      if (!text) return res.status(400).json({ message: 'Description cannot be empty' });
       project.descriptions = [{ heading: '', content: text }];
       project.description = htmlToText(text);
     }
 
-    if (images !== undefined) project.images = images;
-    if (link !== undefined) project.link = link;
-    if (videoLink !== undefined) project.videoLink = videoLink;
-    if (industry !== undefined) project.industry = industry;
-    if (blurImage !== undefined) project.blurImage = !!blurImage;
-    if (featured !== undefined) project.featured = !!featured;
-    if (isActive !== undefined) project.isActive = !!isActive;   // NEW
+    if (images !== undefined) {
+      project.images = normalizeImages(images);
+    }
 
     const updated = await project.save();
     res.json(updated);

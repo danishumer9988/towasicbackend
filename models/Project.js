@@ -5,53 +5,70 @@ const DescriptionBlockSchema = new mongoose.Schema({
   content: { type: String, default: '' }, // HTML from RichTextEditor
 }, { _id: false });
 
+/* NEW: per-image effects sub-schema */
+const ImageEffectsSchema = new mongoose.Schema({
+  enabled:    { type: Boolean, default: false },
+  type:       { type: String, enum: ['box', 'pixelate'], default: 'box' },
+  radius:     { type: Number, default: 12,  min: 0,   max: 40 },
+  brightness: { type: Number, default: 100, min: 50,  max: 150 },
+  contrast:   { type: Number, default: 100, min: 50,  max: 150 },
+  saturation: { type: Number, default: 100, min: 0,   max: 200 },
+  sharpness:  { type: Number, default: 0,   min: 0,   max: 100 },
+}, { _id: false });
+
 const ProjectSchema = new mongoose.Schema({
   projectNumber: {
     type: Number,
-    required: true
+    required: true,
   },
   title: {
     type: String,
-    required: true
+    required: true,
   },
   descriptions: {
     type: [DescriptionBlockSchema],
-    default: []
+    default: [],
   },
   description: {
     type: String,
-    default: ''
+    default: '',
   },
   link: {
     type: String,
-    default: ''
+    default: '',
   },
   videoLink: {
     type: String,
-    default: ''
+    default: '',
   },
   industry: {
     type: String,
-    default: ''
+    default: '',
   },
+
+  /* LEGACY — kept so old projects still render blurred */
   blurImage: {
     type: Boolean,
-    default: false
+    default: false,
   },
+
+  /* NEW — array of { url, effects } objects OR raw url strings.
+     Mixed lets us migrate old data without a DB migration script. */
+  images: {
+    type: [mongoose.Schema.Types.Mixed],
+    default: [],
+  },
+
   featured: {
     type: Boolean,
-    default: false
+    default: false,
   },
-  // NEW: whether this project is visible on the public site
   isActive: {
     type: Boolean,
-    default: true
+    default: true,
   },
-  images: [{
-    type: String
-  }]
 }, {
-  timestamps: true
+  timestamps: true,
 });
 
 module.exports = mongoose.model('Project', ProjectSchema);
